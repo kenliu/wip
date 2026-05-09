@@ -2,82 +2,129 @@
 
 ## 1. Overview
 
-**wip** is a CLI tool for discovering, analyzing, and resuming active LLM sessions across multiple providers (Claude, OpenAI, Google Gemini, etc.). It scans the filesystem for JSONL session files created by various LLM CLIs, analyzes their state, and provides a unified interface to quickly resume work-in-progress conversations.
+**wip** is a CLI tool for tracking and resuming active LLM sessions. It solves the "too many terminal tabs" problem: once you have several chat sessions going simultaneously, it becomes hard to keep track of them and costly to close any — because finding your way back requires effort. **wip** makes it safe to close sessions by ensuring you can always find them again quickly.
+
+The tool runs passively in the background, scanning for session files written by LLM CLIs (Claude Code, OpenCode, etc.), summarizing their content with an LLM, and maintaining a fast local index. When you want to return to a session, `wip` shows you a list of your in-progress work with enough context to immediately recognize and resume it.
 
 ## 2. Core Purpose
 
-- **Auto-discover sessions** - scan filesystem for JSONL session files
-- **Assess session state** - use an LLM to summarize and determine if sessions are done or in-progress
-- **Filter WIP sessions** - show only active/incomplete sessions
-- **Quick resumption** - resume sessions with a single keystroke
-- **Unattended analysis** - scan mode for periodic analysis via cron
-- **Multi-provider support** - start with Claude Code and OpenCode, expand to others
+- **Close with confidence** — sessions are automatically tracked; closing a terminal tab doesn't mean losing context
+- **Return quickly** — `wip` opens instantly showing pre-computed summaries; no waiting
+- **Passive by default** — runs in the background via cron; no user action required to "save" a session
+- **Quick resumption** — resume a session with a single keystroke
+- **Never block** — the UI is always immediate; scanning never blocks the user
+- **Multi-provider support** — start with Claude Code and OpenCode, expand to others
 
-## 3. Key Concepts
+## 3. Design Goals
+
+### User Performance First
+wip is built in Rust for fast startup and low latency. Every user-facing action should feel immediate:
+- `wip` shows the session list instantly from the cached index
+- Scanning happens in the background and never blocks the UI
+- Index reads are the hot path; writes happen asynchronously
+
+**Performance target**: `wip` (no flags) should display the session list in < 100ms.
+
+### Passive by Default
+The tool requires zero ongoing user effort. Sessions are discovered and summarized automatically by a background cron job. The user's only job is to occasionally run `wip` to browse and resume. No "saving" or "checking in" required.
+
+### Minimal UI, Maximum Signal
+The session list shows only what matters: in-progress sessions, sorted by most recent. Done sessions are not shown — they are noise. Each session shows enough context to immediately recognize it without opening it.
+
+## 4. Key Concepts
 
 ### Session File
-JSONL files created by LLM CLI tools (e.g., `~/.local/share/claude/sessions/session-id.jsonl`). Each line is a JSON object representing a message/interaction in the conversation.
+JSONL files created by LLM CLI tools (e.g., `~/.claude/sessions/session-id.jsonl`). Each line is a JSON object representing a message or interaction in the conversation.
 
 ### Session Index
-wip maintains a local index of discovered sessions with:
-- File path
-- Provider (detected from content or config)
-- Session status (done/in-progress)
-- Last assessment timestamp
-- Last file modification timestamp
-- LLM summarization result
-- Display name / description
+wip maintains a local index at `~/.wip/index.json` with:
+- File path and provider
+- Session status (in-progress / done)
+- LLM-generated summary and "left off" description
+- Last file modification and scan timestamps
+- Token usage per assessment
 
 ### Provider
-An LLM CLI tool (Claude, OpenAI, Google Gemini). Configuration includes:
-- Session file glob pattern(s)
-- Command template to launch (with parameter placeholders)
-- Default model/parameters
-- How to parse JSONL files
+An LLM CLI tool (Claude Code, OpenCode, etc.). Configuration includes glob patterns for finding session files, a command template for resuming sessions, and JSONL format details.
 
-## 4. Modes & Commands
+## 5. Modes & Commands
 
 ### User Mode (Default)
 Interactive TUI for session browsing and resumption.
 
 ```
-wip                         # Launch user mode (interactive list)
-wip [search-term]           # Filter sessions by search term
+wip                   # Show in-progress sessions from cached index (instant)
+wip --scan            # Same, but also kick off a background scan (non-blocking)
+wip [search-term]     # Filter sessions by search term
 ```
 
 **User Mode Behavior:**
-1. Scans for sessions (if index is stale)
-2. Displays list of in-progress sessions, sorted by most recent
-3. Shows: session name/path, provider, CLI, last modified time
-4. User presses Enter to resume selected session
-5. Launches configured CLI command for that session in current terminal
+1. Load index from disk instantly
+2. Display in-progress sessions sorted by most recent modification, with arrow-key navigation
+3. If `--scan` flag is set, start a background scan concurrently — does not block or delay display
+4. User navigates with ↑/↓ and presses Enter to select; cursor starts on most recent session
+5. Screen clears, configured CLI launches in the current terminal
+
+The UI is never blocked. The cached index is always shown immediately. If a background scan completes while the UI is open and finds new results, the display updates.
+
+**Keybindings:**
+- `↑` / `↓` — navigate sessions
+- `Enter` — resume selected session (screen clears, CLI takes over)
+- `q` — quit
+
+**Session list display:**
+```
+  IN-PROGRESS SESSIONS
+
+▶ Project X Analysis       claude-code    47m ago
+  Left off: waiting on feedback about rate-limiting design.
+
+  Data Processing          claude-code    2h ago
+  Left off: debugging records with missing zip codes.
+
+  Bug Investigation        opencode       5h ago
+  Left off: need to review logs from staging environment.
+
+  ↑↓ navigate   enter resume   q quit
+```
+
+**After selection:**
+```
+[screen clears]
+[configured CLI launches and takes over the terminal]
+```
 
 ### Scan Mode
-Unattended mode for periodic analysis (cron-friendly).
+Unattended mode for periodic background analysis.
 
 ```
-wip scan                    # Scan filesystem for new/updated sessions
-wip scan --force            # Force re-assessment of all sessions
-wip scan --provider claude  # Scan only Claude sessions
+wip scan                     # Scan for new/modified sessions
+wip scan --force             # Force re-assessment of all sessions
+wip scan --provider claude   # Scan only one provider
 ```
 
 **Scan Mode Behavior:**
-1. Searches filesystem for JSONL files matching configured patterns
-2. Filters for new/modified sessions since last scan
-3. Analyzes each session with an LLM prompt: "Is this session done or in progress?"
-4. Stores assessment in index with timestamps
-5. Exits silently (cron-friendly)
+1. Find all JSONL files matching configured patterns
+2. Skip files unchanged since last scan (0 tokens consumed)
+3. Skip files modified < 5 minutes ago (may still be actively written)
+4. Assess new/modified sessions with an LLM
+5. Update index atomically
+6. Exit silently (cron-friendly)
+
+**Recommended cron schedule**: every 5-10 minutes.
+
+**Optional hook facility**: Users can configure a shell hook to trigger `wip scan` when closing a terminal. This is not required and not the default — the cron job is the primary mechanism. Session closure must never block waiting for a scan.
 
 ### Configuration & Utilities
 ```
-wip config                  # Show current configuration
-wip config edit             # Edit config file
-wip index show              # Show current session index
-wip index clear             # Clear index (forces rescan on next use)
-wip stats                   # Show token usage and scan statistics
+wip config          # Show current configuration
+wip config edit     # Open config file in $EDITOR
+wip index show      # Show raw session index
+wip index clear     # Clear index (forces full rescan on next scan run)
+wip stats           # Show token usage and scan statistics
 ```
 
-**Stats Output Example**:
+**Stats Output Example:**
 ```
 $ wip stats
 Token Usage Summary:
@@ -86,20 +133,20 @@ Token Usage Summary:
   Assessments run: 12 | Skipped (cached): 84
   Last scan: 2 hours ago
 
-Estimated cost: $0.14 (based on claude-3-opus pricing)
+Estimated cost: $0.014 (based on claude-haiku-4-5 pricing)
 
 Per-provider breakdown:
   claude-code: 2,847 tokens (12 assessments)
   opencode: 0 tokens (0 assessments)
 ```
 
-## 5. Data Model & Storage
+## 6. Data Model & Storage
 
 ### Directory Structure
 ```
 ~/.wip/
-├── config.json            # Configuration, provider patterns, CLI templates
-└── index.json             # Session index with assessment results
+├── config.json     # Provider patterns, CLI templates, scan settings
+└── index.json      # Session index with pre-computed summaries
 ```
 
 ### Index Format
@@ -113,7 +160,7 @@ Per-provider breakdown:
       "status": "in-progress",
       "fileModifiedAt": 1715335200,
       "lastScannedAt": 1715338800,
-      "summary": "Designing REST API endpoints for user management. Discussed authentication strategy, debated pagination approach. Left off: waiting on feedback about rate-limiting design.",
+      "summary": "Designing REST API endpoints for user management. Discussed authentication strategy, debated pagination approach.",
       "leftOff": "waiting on feedback about rate-limiting design",
       "cliLauncher": "claude-code",
       "assessment": {
@@ -129,7 +176,7 @@ Per-provider breakdown:
       "status": "done",
       "fileModifiedAt": 1715248800,
       "lastScannedAt": 1715338800,
-      "summary": "Analyzed Q1 sales metrics. Generated charts and identified top-performing regions. Task completed, all findings documented.",
+      "summary": "Analyzed Q1 sales metrics. Generated charts and identified top-performing regions.",
       "leftOff": "task completed, all findings documented",
       "cliLauncher": "opencode",
       "assessment": {
@@ -146,117 +193,120 @@ Per-provider breakdown:
     "totalOutputTokens": 265,
     "assessmentsRun": 2,
     "assessmentsSkipped": 18,
-    "estimatedCost": 0.03
+    "estimatedCost": 0.003
   }
 }
 ```
 
-## 6. Workflows
+## 7. Workflows
 
-### Typical User Workflow
+### Typical Workflow
 ```
 $ wip
-✓ Scanning for sessions...
 
-IN-PROGRESS SESSIONS:
-  1. Project X Analysis          [claude-code]      Modified 47 min ago
-     Designing REST API endpoints. Discussed auth strategy, debated pagination.
-     Left off: waiting on feedback about rate-limiting design.
+  IN-PROGRESS SESSIONS
 
-  2. Data Processing             [claude-code]      Modified 2h ago
-     Processing customer data imports. CSV parsing complete, now handling edge cases.
-     Left off: debugging records with missing zip codes.
+▶ Project X Analysis       claude-code    47m ago
+  Left off: waiting on feedback about rate-limiting design.
 
-  3. Bug Investigation           [opencode]         Modified 5h ago
-     Tracking down race condition in payment processor. Added logging, narrowed scope.
-     Left off: need to review logs from staging environment.
+  Data Processing          claude-code    2h ago
+  Left off: debugging records with missing zip codes.
 
-Select session (1-3, or q to quit): 1
-✓ Resuming: Project X Analysis
-$ claude ~/.claude/sessions/abc123.jsonl
+  Bug Investigation        opencode       5h ago
+  Left off: need to review logs from staging environment.
+
+  ↑↓ navigate   enter resume   q quit
+
+[user presses Enter]
+[screen clears]
+[claude resumes session abc123.jsonl]
 ```
 
-### Cron Scan Workflow
+The list appears instantly from the cached index. Pressing Enter immediately resumes the most recent session — the common case requires zero navigation.
+
+### Background Scan (Cron)
 ```cron
-# Run scan every 2 hours
-0 */2 * * * /usr/local/bin/wip scan
+# Scan every 5 minutes
+*/5 * * * * /usr/local/bin/wip scan
 ```
 
 **Scan Process:**
 1. Find all JSONL files in configured locations
-2. Compare against index (skip unchanged files)
-3. For modified sessions:
-   - Read JSONL to get recent context
-   - Call LLM: "Based on this conversation, is the user still working on this (in-progress) or has it been completed (done)?"
-   - Store assessment result
-4. Update index with new results
-5. Exit
+2. Skip files unchanged since last scan (0 tokens)
+3. Skip files < 5 min old (still being written)
+4. For modified sessions: extract context, call LLM, store result
+5. Update index atomically
+6. Exit silently
 
-### Search/Filter Workflow
+### Scan on Startup (Optional)
+```
+$ wip --scan
+IN-PROGRESS SESSIONS:        [scanning in background...]
+  1. Project X Analysis      [claude-code]    Modified 47 min ago
+     ...
+```
+
+The list appears immediately from the cache. The background scan runs concurrently and updates the index. If it finds new sessions, the display refreshes.
+
+### Search/Filter
 ```
 $ wip project
-✓ Showing sessions matching "project"
-
-IN-PROGRESS SESSIONS:
-  1. Project X Analysis          [claude-cli]       Modified 14:22
-  
-Select session (1, or q to quit): 1
+IN-PROGRESS SESSIONS (matching "project"):
+  1. Project X Analysis      [claude-code]    Modified 47 min ago
+     ...
 ```
 
-## 7. Initial Implementation Scope
+## 8. Implementation Scope
 
 ### Phase 1 (MVP)
-- **User Mode**: Interactive TUI for browsing and resuming in-progress sessions
-- **Scan Mode**: Token-efficient scanning with Rust pre-filtering and timestamp-based caching
-  - JSONL parsing and field extraction (Rust)
-  - Modification time tracking and smart skip logic
-  - LLM assessment only on modified files
-- Claude Code provider support with configurable CLI launcher
+- **User Mode**: Instant TUI from cached index; single-keystroke session resumption
+- **Scan Mode**: Token-efficient background scanning
+  - Glob-based file discovery
+  - Timestamp-based caching (skip unchanged files)
+  - JSONL parsing and field extraction
+  - LLM assessment for modified files only
+- **Non-blocking `--scan` flag**: Background scan concurrent with UI display
+- Claude Code provider support
 - OpenCode provider support
-- JSON-based index storage with mtime tracking
+- Atomic JSON index writes (write to temp, rename)
 - Keychain integration for API keys
-- Configuration file parsing
 - Token usage tracking and cost estimation
 
 ### Phase 2
-- Search/filter in user mode
-- Parallel scanning for multiple providers
-- Session export/reporting
-- Performance optimizations (batch assessment requests)
+- TUI refresh when background scan finds new results
+- Parallel scanning across multiple providers
+- Performance optimizations (batch LLM requests)
+- In-UI search/filter
 
 ### Phase 3
-- Additional providers (Gemini, Codex, others)
-- Advanced filtering and sorting options
-- TUI improvements (pagination, detailed views, session details screen)
+- Additional providers (Gemini, Codex CLI, others)
+- Advanced filtering and sorting
+- Detailed session view
+- Optional terminal close hook integration
 
-## 8. Technical Requirements
+## 9. Technical Requirements
 
 ### Language & Build
 - **Language**: Rust
-- **Distribution**: Single binary (no runtime dependencies)
+- **Distribution**: Single binary, no runtime dependencies
 - **Minimum Rust**: 1.70+
+- **Performance target**: `wip` (no flags) must display the session list in < 100ms
 
 ### Key Dependencies
-- **CLI/TUI**: `clap` (argument parsing), `crossterm` or `termion` (terminal control)
-- **JSON**: `serde` / `serde_json`
-- **Networking**: `reqwest` (HTTP client)
+- **CLI/TUI**: `clap`, `ratatui`, `crossterm`
+- **JSON**: `serde`, `serde_json`
+- **Networking**: `reqwest`
 - **Glob patterns**: `glob`
-- **Keychain**: `keyring` crate (macOS/Linux/Windows support)
-- **API clients**: `anthropic-sdk` or direct HTTP for Claude; `openai-api-rs` or HTTP for OpenAI
-
-### API Integration
-- Claude Code: Use Anthropic SDK (Rust) for assessment
-- OpenCode: Use raw HTTP API for assessment
-- Assessment: Prompt LLM with recent conversation context, parse response for "in-progress" or "done"
-- Credentials: Retrieve from system keychain at runtime, never store in config
+- **Keychain**: `keyring`
+- **Time**: `chrono`
 
 ### File Operations
-- Glob patterns for discovering JSONL files
-- JSONL parsing (line-by-line JSON)
+- Glob-based JSONL file discovery
+- Line-by-line JSONL parsing
 - File modification time tracking
-- Atomic writes for index updates
+- **Atomic index writes** (write to temp file, rename into place): required to prevent corruption on crash or concurrent access
 
-## 9. Configuration
+## 10. Configuration
 
 ### Config File Location
 `~/.wip/config.json`
@@ -289,14 +339,14 @@ Select session (1, or q to quit): 1
     }
   },
   "scan": {
-    "assessmentModel": "claude-3-opus-20250219",
+    "assessmentModel": "claude-haiku-4-5-20251001",
     "assessmentApiKey": {
       "keychainKey": "wip-claude-api-key"
     },
-    "assessmentPrompt": "Analyze the conversation and provide:\n1. status: 'in-progress' or 'done'\n2. summary: 1-2 sentences (20-30 words) about the topic/goal\n3. left_off: 1 sentence (10-15 words) about the last action or next step\n\nKeep responses scannable and concise. Reply in format: status: X\nsummary: Y\nleft_off: Z",
+    "assessmentPrompt": "Analyze the conversation and provide:\n1. status: 'in-progress' or 'done'\n2. summary: 1-2 sentences (20-30 words) about the topic/goal\n3. left_off: 1 sentence (10-15 words) about the last action or next step\n\nReply exactly as:\nstatus: X\nsummary: Y\nleft_off: Z",
     "pricing": {
-      "inputTokensPerMillion": 3,
-      "outputTokensPerMillion": 15
+      "inputTokensPerMillion": 0.80,
+      "outputTokensPerMillion": 4.00
     }
   },
   "storageDir": "~/.wip",
@@ -305,58 +355,39 @@ Select session (1, or q to quit): 1
 ```
 
 ### Config Notes
-
-- **sessionPatterns**: Glob patterns to find session files. Can have multiple per provider.
+- **sessionPatterns**: Glob patterns for finding session files. Multiple patterns per provider.
 - **cliLauncher**: Command template to resume a session. `{sessionPath}` is replaced with the actual file path.
-- **assessmentModel**: Single LLM model used for all session assessments (e.g., `claude-3-opus-20250219`).
-- **assessmentApiKey.keychainKey**: Keychain entry storing the assessment model's API key.
-- **assessmentPrompt**: LLM prompt for determining session status. Can be customized.
-- **pricing**: Optional. Per-million token costs (in dollars) for input/output of the assessment model. Used to calculate estimated costs.
-- **indexRefreshThreshold**: Seconds before index is considered stale (default 1 hour).
+- **assessmentModel**: LLM used for all session assessments. Haiku is recommended for cost efficiency.
+- **assessmentApiKey.keychainKey**: Keychain entry name storing the API key. Never stored in config directly.
+- **assessmentPrompt**: LLM prompt for assessing session status. Customizable.
+- **pricing**: Optional. Per-million token costs (in dollars) for cost estimation in `wip stats`.
+- **indexRefreshThreshold**: Seconds before index is considered stale (informational; does not trigger automatic scan).
 
-## 10. Assessment Logic (Scan Mode)
+## 11. Assessment Logic
 
-### Token-Efficient Scanning Strategy
+### Two-Phase Strategy
 
-**Philosophy**: Use Rust to filter/extract, use LLM only for synthesis. Minimize token consumption.
+**Philosophy**: Use Rust to filter and extract; use LLM only for synthesis. Minimize token consumption.
 
-### Two-Phase Assessment
-
-#### Phase 1: Rust-Based Pre-filtering
+#### Phase 1: Rust Pre-filtering
 For each session file:
+1. Check mtime — if unchanged since last scan, skip entirely (0 tokens)
+2. Skip if file was modified < 5 minutes ago (may still be actively written)
+3. Parse JSONL line by line; extract only: `role`, `content`, `timestamp`
+4. Discard metadata, tool output, formatting, and all other fields
+5. Build context block: first user message + last 5-10 user messages + last 5 assistant responses
+6. Estimate token count (1 token ≈ 4 chars); truncate aggressively if over threshold (~500 tokens)
 
-1. **Check modification time**:
-   - If file hasn't changed since last assessment → skip, use cached result
-   - If file was modified very recently (< 5 min) → skip, defer until next scan
-   
-2. **Parse JSONL and extract only relevant fields**:
-   - Read entire file, but extract only: `timestamp`, `role` (user/assistant), `content`
-   - Discard metadata, formatting, unused fields
-   - Extract **last 5-10 user messages** and **last 5 assistant responses**
-   - Also extract **first user message** (session topic context)
-   
-3. **Build minimal context block**:
-   ```
-   First message: [user's initial message ~50-100 words]
-   
-   Recent (last ~30 messages):
-   [timestamps and role:content pairs, omitting verbose output]
-   ```
-   
-4. **Calculate approximate token count**:
-   - Rough estimate: 1 token ≈ 4 chars
-   - If estimated tokens > threshold (e.g., 500), truncate more aggressively
-
-#### Phase 2: LLM Assessment (Only on Modified Files)
-Send pre-filtered content to the configured assessment model (same model for all sessions, all providers):
+#### Phase 2: LLM Assessment
+Send pre-filtered context to the configured assessment model:
 
 ```
-Analyze this session snippet and provide:
+Analyze this session and provide:
 1. status: 'in-progress' or 'done'
 2. summary: 1-2 sentences (20-30 words) about the topic/goal
-3. left_off: 1 sentence (10-15 words) about the last action/next step
+3. left_off: 1 sentence (10-15 words) about the last action or next step
 
-Recent session:
+Session context:
 [pre-filtered content from Phase 1]
 
 Reply exactly as:
@@ -365,38 +396,20 @@ summary: [text]
 left_off: [text]
 ```
 
-**Token Tracking**:
-- Capture `usage` from LLM response (input_tokens, output_tokens, total_tokens)
-- Store per-session: `assessment.tokensUsed`, `assessment.inputTokens`, `assessment.outputTokens`
-- Track aggregate stats: total tokens, number of assessments run vs. skipped
-- Calculate estimated cost based on assessment model's configured pricing
+**Token tracking**: Capture `usage` from LLM response. Store per-session (`assessment.inputTokens`, `assessment.outputTokens`) and aggregate in `tokenUsageStats`.
 
-### Caching & Optimization
-- **Timestamp tracking in index**:
-  ```json
-  {
-    "path": "/path/to/session.jsonl",
-    "lastFileModified": 1715335200,
-    "lastScanned": 1715338800,
-    "assessment": {...}
-  }
-  ```
-- **Skip conditions**:
-  - File mtime ≤ lastFileModified → skip (no changes)
-  - File age < 5 minutes → skip (still writing)
-  - Assessment exists and file unchanged → use cached result
-  
-- **Batch processing**: If many files need assessment, batch them (e.g., 5 files per LLM request) to reduce overhead
-- **Incremental scans**: Only process new/modified files; leave unchanged files alone
+### Skip Conditions
+- File mtime ≤ last scanned mtime → skip (cached result is current)
+- File age < 5 minutes → skip (still being written)
+- `--force` flag bypasses all skip conditions
 
-### Expected Token Savings
-- **Before**: ~500-2000 tokens per session (full conversation)
-- **After**: ~200-400 tokens per session (pre-filtered + first message)
-- **With caching**: Most scans reuse cached assessments (0 tokens)
+### Expected Token Usage
+- New or modified session: ~200-400 tokens
+- Cached/unchanged session: 0 tokens
+- Typical cron run: majority of sessions cached → very low marginal cost
 
 ### Edge Cases
-- Empty JSONL: Skip
-- Malformed JSONL: Log error, keep previous assessment if exists
-- File still being written: Skip, retry next scan
-- LLM API failures: Keep previous assessment, flag for retry
-- Parse failures: Use previous summary if available
+- Empty JSONL → skip
+- Malformed JSONL → log error, retain previous assessment if one exists
+- LLM API failure → retain previous assessment, retry on next scan
+- File deleted since last scan → remove from index
