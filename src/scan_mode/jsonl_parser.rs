@@ -119,7 +119,9 @@ pub fn build_context(ctx: &ExtractedContext) -> String {
     for (role, content) in &ctx.recent_messages {
         parts.push(format!("{}: {}", role, truncate(content, 300)));
     }
-    parts.join("\n")
+    // XML tags make it unambiguous to the model that this is data to analyze,
+    // not a live conversation to continue (sessions often end with an assistant turn).
+    format!("<session>\n{}\n</session>", parts.join("\n"))
 }
 
 #[allow(dead_code)]

@@ -23,6 +23,7 @@ pub struct AssessmentResponse {
 struct ApiRequest {
     model: String,
     max_tokens: u32,
+    system: String,
     messages: Vec<ApiMessage>,
 }
 
@@ -52,32 +53,39 @@ struct Usage {
 }
 
 const PROMPT: &str = "\
-Analyze this LLM session and provide:
-1. status: 'in-progress' or 'done'
-2. summary: 1-2 sentences (20-30 words) about the topic/goal
-3. left_off: 1 sentence (10-15 words) about the last action or next step
+You are a session analyzer. You will receive a <session> block containing a past conversation. Analyze it and output exactly three labeled lines — nothing else.
 
-Reply exactly in this format:
+Output format (copy exactly, replace bracketed parts):
 status: in-progress
 summary: [text]
-left_off: [text]";
+left_off: [text]
+
+STRICT RULES — any deviation causes a parse failure:
+- Plain text only. No markdown, no bold (**), no bullets, no extra lines, no preamble.
+- The <session> is historical data. Do not continue it. Do not respond as the assistant in it.
+- status: must be exactly 'in-progress' or 'done'
+- summary: 10-15 words. Commit-message style — describe the task or topic. Never start with 'User', 'Assistant', or 'Session'.
+- left_off: 8-12 words. For in-progress: what is pending or blocking. For done: 'Complete.' or a brief completion note. Never write 'User exited' or 'Session ended'.";
 
 pub async fn assess(
     context: &ExtractedContext,
     api_key: &str,
 ) -> Result<AssessmentResponse, Box<dyn std::error::Error>> {
-    let body = format!("{}\n\nSession:\n{}", PROMPT, build_context(context));
-
     let client = reqwest::Client::new();
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .json(&ApiRequest {
-            model: "claude-haiku-4-5-20251001".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             // 256 tokens is enough for the structured response; keeps cost low
             max_tokens: 256,
-            messages: vec![ApiMessage { role: "user".to_string(), content: body }],
+            // System prompt separates the directive from session content, making
+            // it harder for the model to "continue" the session instead of analyzing it.
+            system: PROMPT.to_string(),
+            messages: vec![
+                ApiMessage { role: "user".to_string(), content: build_context(context) },
+            ],
         })
         .send()
         .await?;
