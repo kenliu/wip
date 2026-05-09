@@ -81,10 +81,20 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Resolve the path to the running wip binary
-    let wip_bin = std::env::current_exe()
-        .map_err(|e| format!("Could not determine wip binary path: {}", e))?;
-    let wip_bin = wip_bin.to_string_lossy().to_string();
+    // Prompt for the binary path, suggesting the current executable as a default.
+    // The user may be running from a debug build or a non-standard location, so
+    // we don't assume current_exe() is the right path for the plist.
+    let suggested_bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin/wip".to_string());
+
+    print!("Path to wip binary [{}]: ", suggested_bin);
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let wip_bin = input.trim().to_string();
+    let wip_bin = if wip_bin.is_empty() { suggested_bin } else { wip_bin };
 
     // Embed the current API key — launchd agents don't inherit shell environment.
     // This will be replaced by keychain lookup once issue #5 is implemented.
