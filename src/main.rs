@@ -1,8 +1,9 @@
 use clap::Parser;
 
 mod index;
-mod user_mode;
+mod install_mode;
 mod scan_mode;
+mod user_mode;
 
 #[derive(Parser)]
 #[command(name = "wip")]
@@ -19,6 +20,10 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Install launchd agent for automatic background scanning (macOS)
+    Install,
+    /// Uninstall the launchd agent
+    Uninstall,
 }
 
 #[tokio::main]
@@ -29,6 +34,8 @@ async fn main() {
     let result = match cli.command {
         None => user_mode::run().await,
         Some(Command::Scan { force }) => scan_mode::run(force).await,
+        Some(Command::Install) => install_mode::install(),
+        Some(Command::Uninstall) => install_mode::uninstall(),
     };
 
     if let Err(e) = result {
