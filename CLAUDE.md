@@ -12,10 +12,26 @@ See `WIP_SPEC.md` for the complete specification.
 
 ```bash
 cargo build                 # Debug build
-cargo build --release       # Optimized binary
-cargo run -- [args]         # Run directly
-wip                         # Run user mode (after install)
-wip scan                    # Run scan mode
+cargo build --release       # Optimized binary for production
+cargo check                 # Quick syntax/type check (no binary)
+cargo run                   # Run user mode (default)
+cargo run -- scan           # Run scan mode
+cargo run -- stats          # Show token usage stats
+cargo run -- config         # Show configuration
+cargo test                  # Run tests
+cargo clippy                # Linting
+cargo fmt                   # Format code
+```
+
+**Binary locations:**
+- Debug: `target/debug/wip`
+- Release: `target/release/wip`
+
+**Run examples:**
+```bash
+cargo run -- scan --force
+cargo run -- scan --provider claude-code
+./target/release/wip                        # After release build
 ```
 
 ## Key Architectural Decisions
