@@ -9,13 +9,17 @@ pub struct Index {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionEntry {
     pub path: String,
+    // UUID filename stem, passed to `claude --resume` to resume the session
     pub session_id: String,
     pub provider: String,
     pub status: String, // "in-progress" or "done"
+    // Unix timestamps — i64 to match filesystem mtime values
     pub file_modified_at: i64,
     pub last_scanned_at: i64,
+    // LLM-generated fields from assessment
     pub summary: String,
     pub left_off: String,
+    // Working directory at the time the session was active; used to cd before resuming
     pub cwd: Option<String>,
 }
 
@@ -39,6 +43,8 @@ impl Index {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Atomic write: write to a temp file then rename to avoid corrupting the index
+        // if the process crashes mid-write
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
         std::fs::rename(&tmp, path)?;
@@ -50,6 +56,8 @@ impl Index {
             .iter()
             .filter(|s| s.status == "in-progress")
             .collect();
+        // Most recently modified first — these are the sessions the user is most
+        // likely to want to return to
         sessions.sort_by(|a, b| b.file_modified_at.cmp(&a.file_modified_at));
         sessions
     }

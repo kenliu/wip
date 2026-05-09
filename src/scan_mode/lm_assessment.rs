@@ -1,6 +1,15 @@
+// Sends a pre-filtered session context to the Anthropic API and parses the
+// structured response into status, summary, and left_off fields.
+//
+// We use a strict output format ("status: X\nsummary: Y\nleft_off: Z") rather
+// than JSON to reduce output tokens. The parser searches for each prefix rather
+// than requiring the lines to appear in order, since the LLM occasionally adds
+// preamble text before the structured output.
+
 use crate::scan_mode::jsonl_parser::{build_context, ExtractedContext};
 use serde::{Deserialize, Serialize};
 
+// input_tokens and output_tokens are tracked for cost reporting in scan.log.jsonl
 #[allow(dead_code)]
 pub struct AssessmentResponse {
     pub status: String,
@@ -66,6 +75,7 @@ pub async fn assess(
         .header("anthropic-version", "2023-06-01")
         .json(&ApiRequest {
             model: "claude-haiku-4-5-20251001".to_string(),
+            // 256 tokens is enough for the structured response; keeps cost low
             max_tokens: 256,
             messages: vec![ApiMessage { role: "user".to_string(), content: body }],
         })
@@ -105,6 +115,7 @@ fn parse_response(text: &str) -> Result<(String, String, String), Box<dyn std::e
         if status.is_empty() {
             if let Some(v) = line.strip_prefix("status:") {
                 let v = v.trim();
+                // Only accept the two valid values; rejects partial or malformed responses
                 if v == "in-progress" || v == "done" {
                     status = v.to_string();
                 }

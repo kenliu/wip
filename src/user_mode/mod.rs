@@ -1,3 +1,7 @@
+// User mode: loads the pre-computed index and presents an fzf-powered session
+// picker. On selection, clears the screen and execs claude, replacing this
+// process entirely so there's no intermediate shell layer.
+
 use crate::index::{index_path, Index};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -22,11 +26,13 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
+        // Count by chars not bytes to avoid splitting multi-byte UTF-8 characters
         s.chars().take(max.saturating_sub(3)).collect::<String>() + "..."
     }
 }
 
 fn project_name(cwd: &str) -> String {
+    // Derive a short project label from the session's working directory
     std::path::Path::new(cwd)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -34,12 +40,12 @@ fn project_name(cwd: &str) -> String {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Verify fzf is available
     if Command::new("fzf").arg("--version").output().is_err() {
         return Err("fzf is not installed. Install it with: brew install fzf".into());
     }
 
     let index = Index::load(&index_path())?;
+    // Filter out any agent sessions that slipped into the index from previous scans
     let sessions: Vec<_> = index.in_progress_sessions()
         .into_iter()
         .filter(|s| !s.session_id.starts_with("agent-"))
@@ -50,8 +56,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Format: session_id TAB cwd TAB display_line
-    // fzf shows only field 3 (display_line); fields 1+2 are parsed after selection
+    // Each line sent to fzf is tab-delimited: session_id TAB cwd TAB display_line
+    // fzf only shows field 3 (--with-nth=3); fields 1 and 2 are invisible to the
+    // user but returned in the selected output so we can extract them after selection
     let lines: Vec<String> = sessions.iter().map(|s| {
         let age = format_age(s.file_modified_at);
         let cwd = s.cwd.as_deref().unwrap_or("");
@@ -66,9 +73,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut fzf = Command::new("fzf")
         .args([
             "--delimiter=\t",
-            "--with-nth=3",
-            "--no-sort",
-            "--reverse",
+            "--with-nth=3",   // only display field 3; fields 1+2 are hidden metadata
+            "--no-sort",      // preserve recency order from the index
+            "--reverse",      // most recent at the top
             "--prompt=wip > ",
             "--height=50%",
             "--info=hidden",
@@ -81,7 +88,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = fzf.wait_with_output()?;
 
-    // User cancelled (Escape or ctrl-c)
+    // fzf exits with non-zero status when the user cancels (Escape or ctrl-c)
     if !output.status.success() {
         return Ok(());
     }
@@ -95,10 +102,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Could not parse selected session".into());
     }
 
-    // Clear screen then exec claude, replacing this process
+    // Clear the terminal before handing off so claude starts with a clean screen
     print!("\x1B[2J\x1B[1;1H");
     std::io::stdout().flush()?;
 
+    // exec() replaces this process with claude entirely — no wip process remains.
+    // current_dir() sets the working directory for claude, not the parent shell
+    // (see GitHub issue #2 for shell integration to solve the cwd-after-exit problem)
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("claude");
     cmd.arg("--resume").arg(&session_id);

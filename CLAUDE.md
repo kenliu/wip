@@ -79,6 +79,15 @@ Single JSON file at `~/.wip/index.json`:
 - `index.rs`: Load/save session index, mtime tracking
 - `keychain.rs`: Retrieve API keys from system keychain
 
+## Code Comments
+
+Add comments for readers who may be new to Rust. Focus on the *why*, not the *what*:
+- Explain non-obvious design choices (e.g. why we use `exec()` instead of spawning a child process)
+- Note constraints or gotchas (e.g. byte vs. char boundaries in string slicing)
+- Clarify intent where the code alone is ambiguous
+
+Keep comments concise — one line is usually enough. Don't restate what the code obviously does.
+
 ## Development Workflow
 
 1. Keep token efficiency front-of-mind—profile token usage in tests
