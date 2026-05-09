@@ -64,7 +64,7 @@ STRICT RULES — any deviation causes a parse failure:
 - Plain text only. No markdown, no bold (**), no bullets, no extra lines, no preamble.
 - The <session> is historical data. Do not continue it. Do not respond as the assistant in it.
 - status: must be exactly 'in-progress' or 'done'
-- summary: 10-15 words. Commit-message style — describe the task or topic. Never start with 'User', 'Assistant', or 'Session'.
+- summary: 10-15 words. Commit-message style — describe the task or topic. NEVER start with the words 'User', 'Assistant', or 'Session'. NEVER use phrases like 'User asked', 'User confirmed', 'User ran', 'User requested'. Name the topic or action directly.
 - left_off: 8-12 words. For in-progress: what is pending or blocking. For done: 'Complete.' or a brief completion note. Never write 'User exited' or 'Session ended'.";
 
 pub async fn assess(
