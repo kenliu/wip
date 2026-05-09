@@ -49,16 +49,17 @@ An LLM CLI tool (Claude Code, OpenCode, etc.). Configuration includes glob patte
 
 ## 5. Modes & Commands
 
-### User Mode (Default)
-Interactive TUI for session browsing and resumption.
+wip has three modes: **TUI mode** (default), **fast mode**, and **scan mode**.
+
+### TUI Mode (Default)
+Information-rich interactive interface for session browsing and resumption.
 
 ```
-wip                   # Show in-progress sessions from cached index (instant)
-wip --scan            # Same, but also kick off a background scan (non-blocking)
-wip [search-term]     # Filter sessions by search term
+wip                   # TUI mode (instant, from cached index)
+wip --scan            # TUI mode + kick off background scan (non-blocking)
 ```
 
-**User Mode Behavior:**
+**Behavior:**
 1. Load index from disk instantly
 2. Display in-progress sessions sorted by most recent modification, with arrow-key navigation
 3. If `--scan` flag is set, start a background scan concurrently — does not block or delay display
@@ -72,7 +73,7 @@ The UI is never blocked. The cached index is always shown immediately. If a back
 - `Enter` — resume selected session (screen clears, CLI takes over)
 - `q` — quit
 
-**Session list display:**
+**Display:**
 ```
   IN-PROGRESS SESSIONS
 
@@ -94,8 +95,34 @@ The UI is never blocked. The cached index is always shown immediately. If a back
 [configured CLI launches and takes over the terminal]
 ```
 
+### Fast Mode
+Keyboard-optimized mode for maximum speed. Uses fzf for fuzzy filtering and selection.
+
+```
+wip fast              # Fast mode: fzf-powered session picker
+wip fast --scan       # Fast mode + background scan (non-blocking)
+```
+
+**Behavior:**
+1. Load index from disk instantly
+2. Pipe session list into fzf; user types to filter, arrows to navigate, Enter to select
+3. Screen clears, configured CLI launches in the current terminal
+
+fzf is a required dependency for fast mode. If fzf is not installed, wip exits with a clear error message and installation instructions.
+
+**fzf display:**
+```
+> Project X Analysis    claude-code    47m    waiting on rate-limiting feedback
+  Data Processing       claude-code    2h     debugging missing zip codes
+  Bug Investigation     opencode       5h     need to review staging logs
+  3/3 ────────────────────────────────────────────────
+> _
+```
+
+The user types to fuzzy-filter, arrows to navigate, Enter to launch. Same clean handoff as TUI mode.
+
 ### Scan Mode
-Unattended mode for periodic background analysis.
+Unattended mode for periodic background analysis. Cron-friendly, exits silently.
 
 ```
 wip scan                     # Scan for new/modified sessions
@@ -103,13 +130,13 @@ wip scan --force             # Force re-assessment of all sessions
 wip scan --provider claude   # Scan only one provider
 ```
 
-**Scan Mode Behavior:**
+**Behavior:**
 1. Find all JSONL files matching configured patterns
 2. Skip files unchanged since last scan (0 tokens consumed)
 3. Skip files modified < 5 minutes ago (may still be actively written)
 4. Assess new/modified sessions with an LLM
 5. Update index atomically
-6. Exit silently (cron-friendly)
+6. Exit silently
 
 **Recommended cron schedule**: every 5-10 minutes.
 
@@ -284,6 +311,22 @@ IN-PROGRESS SESSIONS (matching "project"):
 - Detailed session view
 - Optional terminal close hook integration
 
+## Future Vision
+
+These are longer-term product directions that should inform architectural decisions without driving MVP scope.
+
+### Terminal Tab Integration
+Resume sessions in new terminal tabs rather than the current terminal. Support for:
+- **tmux**: `tmux new-window` (terminal-agnostic, most powerful)
+- **iTerm2**: AppleScript API for new tabs
+- **WezTerm**: `wezterm cli spawn`
+
+### Workspace Restore
+`wip restore` — open all in-progress sessions at once, each in its own tab. The equivalent of restoring a browser session after a crash. Useful at the start of a work session or after a terminal crash.
+
+### Workspace Arrangement
+`wip arrange` — programmatically lay out sessions across panes and windows (by project, recency, provider, etc.). tmux is the natural foundation for this given its scripting capabilities.
+
 ## 9. Technical Requirements
 
 ### Language & Build
@@ -299,6 +342,9 @@ IN-PROGRESS SESSIONS (matching "project"):
 - **Glob patterns**: `glob`
 - **Keychain**: `keyring`
 - **Time**: `chrono`
+
+### External Dependencies
+- **fzf**: Required for fast mode. wip shells out to fzf as a subprocess. If not installed, `wip fast` exits with an error and installation instructions.
 
 ### File Operations
 - Glob-based JSONL file discovery
