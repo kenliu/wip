@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 
 mod config;
+mod fast_mode;
 mod index;
 mod install_mode;
 mod scan_mode;
+mod stats_mode;
 mod user_mode;
 
 #[derive(Parser)]
@@ -14,13 +16,15 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Parser)]
+#[derive(Subcommand)]
 enum Command {
     /// Scan filesystem for sessions and summarize their state
     Scan {
         #[arg(long)]
         force: bool,
     },
+    /// fzf-powered session picker (requires fzf)
+    Fast,
     /// Install launchd agent for automatic background scanning (macOS)
     Install,
     /// Uninstall the launchd agent
@@ -30,6 +34,8 @@ enum Command {
         #[command(subcommand)]
         action: IndexAction,
     },
+    /// Show token usage and scan statistics
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -45,10 +51,14 @@ async fn main() {
 
     let result = match cli.command {
         None => user_mode::run().await,
+        Some(Command::Fast) => fast_mode::run().await,
         Some(Command::Scan { force }) => scan_mode::run(force).await,
         Some(Command::Install) => install_mode::install(),
         Some(Command::Uninstall) => install_mode::uninstall(),
-        Some(Command::Index { action: IndexAction::Clear }) => index_clear(),
+        Some(Command::Index {
+            action: IndexAction::Clear,
+        }) => index_clear(),
+        Some(Command::Stats) => stats_mode::run(),
     };
 
     if let Err(e) = result {
@@ -69,7 +79,10 @@ fn index_clear() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_file(&path)?;
         println!("Deleted {}", path.display());
     } else {
-        println!("Index does not exist ({}), nothing to clear.", path.display());
+        println!(
+            "Index does not exist ({}), nothing to clear.",
+            path.display()
+        );
     }
     Ok(())
 }

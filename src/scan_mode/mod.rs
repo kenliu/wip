@@ -124,12 +124,14 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
         let continuation = jsonl_parser::is_continuation_session(&file);
 
-        eprintln!("Summarizing: {}", session_id);
-
         let context = match jsonl_parser::parse_and_extract(&file) {
             Ok(c) => c,
-            Err(e) => { eprintln!("  Parse error: {}", e); continue; }
+            // "No messages found" means the session was created but never used — skip silently
+            Err(e) if e.to_string() == "No messages found" => continue,
+            Err(e) => { eprintln!("  Parse error {}: {}", session_id, e); continue; }
         };
+
+        eprintln!("Summarizing: {}", session_id);
 
         let result = match lm_summarizer::summarize(&context, &summarizer_config).await {
             Ok(r) => r,
@@ -161,6 +163,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             left_off: result.left_off,
             cwd: context.cwd,
             continuation,
+            last_prompt: context.last_prompt,
         });
     }
 
@@ -184,6 +187,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let total_tokens = input_tokens_total + output_tokens_total;
     let log_entry = serde_json::json!({
         "timestamp": timestamp_str(),
+        "unix_ts": now,
         "summaries_run": summaries_run,
         "in_progress": in_progress,
         "done": done,

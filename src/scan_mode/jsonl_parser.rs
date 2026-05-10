@@ -18,6 +18,8 @@ pub struct ExtractedContext {
     pub recent_messages: Vec<(String, String)>, // (role, content)
     // Working directory from the session file, used to resume in the right directory
     pub cwd: Option<String>,
+    // The last thing the user typed, from the `last-prompt` record written at session end
+    pub last_prompt: Option<String>,
 }
 
 /// Returns true if this session was started via a queue-operation (an automated
@@ -39,6 +41,7 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
     let content = std::fs::read_to_string(path)?;
     let mut messages: Vec<(String, String)> = Vec::new();
     let mut cwd: Option<String> = None;
+    let mut last_prompt: Option<String> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -67,6 +70,12 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
                     messages.push(("assistant".to_string(), text));
                 }
             }
+            // Multiple last-prompt records can appear; keep the final one
+            Some("last-prompt") => {
+                if let Some(s) = v.get("lastPrompt").and_then(|s| s.as_str()) {
+                    last_prompt = Some(s.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -76,7 +85,7 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
     }
 
     let first_message = messages.first()
-        .map(|(_, c)| truncate(c, 500))
+        .map(|(_, c)| c.clone())
         .unwrap_or_default();
 
     // Keep only the tail of the conversation — the recent context is what matters
@@ -84,14 +93,14 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
     let recent_start = messages.len().saturating_sub(15);
     let recent_messages = messages[recent_start..].to_vec();
 
-    Ok(ExtractedContext { first_message, recent_messages, cwd })
+    Ok(ExtractedContext { first_message, recent_messages, cwd, last_prompt })
 }
 
 fn extract_user_content(v: &Value) -> Option<String> {
     let content = v.get("message")?.get("content")?;
     match content {
         // Simple user messages are plain strings
-        Value::String(s) => Some(truncate(s, 1000)),
+        Value::String(s) => Some(s.to_string()),
         // Tool result messages use the content block array format
         Value::Array(arr) => {
             let text: String = arr.iter()
@@ -104,7 +113,7 @@ fn extract_user_content(v: &Value) -> Option<String> {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            if text.is_empty() { None } else { Some(truncate(&text, 1000)) }
+            if text.is_empty() { None } else { Some(text) }
         }
         _ => None,
     }
@@ -124,7 +133,7 @@ fn extract_assistant_content(v: &Value) -> Option<String> {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    if text.is_empty() { None } else { Some(truncate(&text, 1000)) }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 // Builds the context string sent to the summarizer LLM. Includes the first
@@ -133,7 +142,7 @@ pub fn build_context(ctx: &ExtractedContext) -> String {
     let mut parts = vec![format!("First message: {}", ctx.first_message)];
     parts.push("\nRecent messages:".to_string());
     for (role, content) in &ctx.recent_messages {
-        parts.push(format!("{}: {}", role, truncate(content, 300)));
+        parts.push(format!("{}: {}", role, content));
     }
     // XML tags make it unambiguous to the model that this is data to analyze,
     // not a live conversation to continue (sessions often end with an assistant turn).
@@ -146,11 +155,3 @@ pub fn estimate_tokens(text: &str) -> usize {
     (text.len() + 3) / 4
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        // Count by chars not bytes to avoid splitting multi-byte UTF-8 characters
-        s.chars().take(max.saturating_sub(3)).collect::<String>() + "..."
-    }
-}

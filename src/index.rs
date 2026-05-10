@@ -25,6 +25,9 @@ pub struct SessionEntry {
     // These are chained sessions where only the latest per cwd is worth showing.
     #[serde(default)]
     pub continuation: bool,
+    // The last thing the user typed, from the `last-prompt` record in the JSONL file
+    #[serde(default)]
+    pub last_prompt: Option<String>,
 }
 
 pub fn index_path() -> PathBuf {
