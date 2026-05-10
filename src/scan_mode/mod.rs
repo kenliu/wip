@@ -187,6 +187,26 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const SETUP_GUIDE: &str = "\
+wip is not configured. Set up a Claude API connection to get started:
+
+  Option 1 — Anthropic API key (simplest):
+    export ANTHROPIC_API_KEY=sk-ant-...
+    Add to ~/.zshrc or ~/.bashrc to make it permanent.
+
+  Option 2 — Google Cloud Vertex AI:
+    Create ~/.wip/config.json:
+    {
+      \"scan\": {
+        \"summary_backend\": \"vertex\",
+        \"vertex_project_id\": \"your-gcp-project\",
+        \"summary_model\": \"claude-sonnet-4-6\"
+      }
+    }
+    Then run: gcloud auth application-default login
+
+Then run: wip scan";
+
 /// Builds the summarizer config from ~/.wip/config.json, falling back to the
 /// ANTHROPIC_API_KEY env var with the default model when no config file exists.
 fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Error>> {
@@ -207,19 +227,18 @@ fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Err
                 }
                 SummaryBackend::Anthropic => {
                     let api_key = std::env::var("ANTHROPIC_API_KEY")
-                        .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
+                        .map_err(|_| "ANTHROPIC_API_KEY is not set. Add it to your shell profile or set it in the current shell.")?;
                     Ok(SummarizerConfig::Anthropic { api_key, model })
                 }
             }
         }
-        // No config file — fall back to env var with default model
-        Err(_) => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
-            Ok(SummarizerConfig::Anthropic {
+        // No config file and no API key — show the full setup guide
+        Err(_) => match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(api_key) => Ok(SummarizerConfig::Anthropic {
                 api_key,
                 model: "claude-sonnet-4-6".to_string(),
-            })
-        }
+            }),
+            Err(_) => Err(SETUP_GUIDE.into()),
+        },
     }
 }

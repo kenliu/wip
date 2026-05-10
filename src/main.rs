@@ -52,7 +52,13 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        let msg = e.to_string();
+        // Setup guides and user-facing messages are self-describing; other errors get a prefix.
+        if msg.starts_with("wip ") {
+            eprintln!("{}", msg);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
         std::process::exit(1);
     }
 }
