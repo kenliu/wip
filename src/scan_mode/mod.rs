@@ -273,6 +273,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
         };
         ScanConfig {
             summary_backend: SummaryBackend::Vertex,
+            // Explicitly set the model — Default::default() for String is "",
+            // not the serde default, so we must populate it here.
+            summary_model: "claude-sonnet-4-6".to_string(),
             vertex_project_id: Some(project_id),
             vertex_region: Some(region),
             ..Default::default()
@@ -280,6 +283,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
     } else {
         ScanConfig {
             summary_backend: SummaryBackend::Anthropic,
+            summary_model: "claude-sonnet-4-6".to_string(),
             ..Default::default()
         }
     };
