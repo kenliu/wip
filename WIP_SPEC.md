@@ -42,7 +42,7 @@ wip maintains a local index at `~/.wip/index.json` with:
 - Session status (in-progress / done)
 - LLM-generated summary and "left off" description
 - Last file modification and scan timestamps
-- Token usage per assessment
+- Token usage per summary
 
 ### Provider
 An LLM CLI tool (Claude Code, OpenCode, etc.). Configuration includes glob patterns for finding session files, a command template for resuming sessions, and JSONL format details.
@@ -126,7 +126,7 @@ Unattended mode for periodic background analysis. Cron-friendly, exits silently.
 
 ```
 wip scan                     # Scan for new/modified sessions
-wip scan --force             # Force re-assessment of all sessions
+wip scan --force             # Force re-summarization of all sessions
 wip scan --provider claude   # Scan only one provider
 ```
 
@@ -134,7 +134,7 @@ wip scan --provider claude   # Scan only one provider
 1. Find all JSONL files matching configured patterns
 2. Skip files unchanged since last scan (0 tokens consumed)
 3. Skip files modified < 5 minutes ago (may still be actively written)
-4. Assess new/modified sessions with an LLM
+4. Summarize new/modified sessions with an LLM
 5. Update index atomically
 6. Exit silently
 
@@ -157,14 +157,14 @@ $ wip stats
 Token Usage Summary:
   Total tokens: 2,847
   Input: 1,634 | Output: 1,213
-  Assessments run: 12 | Skipped (cached): 84
+  Summaries run: 12 | Skipped (cached): 84
   Last scan: 2 hours ago
 
 Estimated cost: $0.014 (based on claude-haiku-4-5 pricing)
 
 Per-provider breakdown:
-  claude-code: 2,847 tokens (12 assessments)
-  opencode: 0 tokens (0 assessments)
+  claude-code: 2,847 tokens (12 summaries)
+  opencode: 0 tokens (0 summaries)
 ```
 
 ## 6. Data Model & Storage
@@ -190,7 +190,7 @@ Per-provider breakdown:
       "summary": "Designing REST API endpoints for user management. Discussed authentication strategy, debated pagination approach.",
       "leftOff": "waiting on feedback about rate-limiting design",
       "cliLauncher": "claude-code",
-      "assessment": {
+      "summary": {
         "tokensUsed": 287,
         "inputTokens": 156,
         "outputTokens": 131
@@ -206,7 +206,7 @@ Per-provider breakdown:
       "summary": "Analyzed Q1 sales metrics. Generated charts and identified top-performing regions.",
       "leftOff": "task completed, all findings documented",
       "cliLauncher": "opencode",
-      "assessment": {
+      "summary": {
         "tokensUsed": 312,
         "inputTokens": 178,
         "outputTokens": 134
@@ -218,8 +218,8 @@ Per-provider breakdown:
     "totalTokensUsed": 599,
     "totalInputTokens": 334,
     "totalOutputTokens": 265,
-    "assessmentsRun": 2,
-    "assessmentsSkipped": 18,
+    "summariesRun": 2,
+    "summariesSkipped": 18,
     "estimatedCost": 0.003
   }
 }
@@ -291,7 +291,7 @@ IN-PROGRESS SESSIONS (matching "project"):
   - Glob-based file discovery
   - Timestamp-based caching (skip unchanged files)
   - JSONL parsing and field extraction
-  - LLM assessment for modified files only
+  - LLM summarization for modified files only
 - **Non-blocking `--scan` flag**: Background scan concurrent with UI display
 - Claude Code provider support
 - OpenCode provider support
@@ -385,11 +385,11 @@ Resume sessions in new terminal tabs rather than the current terminal. Support f
     }
   },
   "scan": {
-    "assessmentModel": "claude-haiku-4-5-20251001",
-    "assessmentApiKey": {
+    "summaryModel": "claude-haiku-4-5-20251001",
+    "summaryApiKey": {
       "keychainKey": "wip-claude-api-key"
     },
-    "assessmentPrompt": "Analyze the conversation and provide:\n1. status: 'in-progress' or 'done'\n2. summary: 1-2 sentences (20-30 words) about the topic/goal\n3. left_off: 1 sentence (10-15 words) about the last action or next step\n\nReply exactly as:\nstatus: X\nsummary: Y\nleft_off: Z",
+    "summaryPrompt": "Analyze the conversation and provide:\n1. status: 'in-progress' or 'done'\n2. summary: 1-2 sentences (20-30 words) about the topic/goal\n3. left_off: 1 sentence (10-15 words) about the last action or next step\n\nReply exactly as:\nstatus: X\nsummary: Y\nleft_off: Z",
     "pricing": {
       "inputTokensPerMillion": 0.80,
       "outputTokensPerMillion": 4.00
@@ -403,13 +403,13 @@ Resume sessions in new terminal tabs rather than the current terminal. Support f
 ### Config Notes
 - **sessionPatterns**: Glob patterns for finding session files. Multiple patterns per provider.
 - **cliLauncher**: Command template to resume a session. `{sessionPath}` is replaced with the actual file path.
-- **assessmentModel**: LLM used for all session assessments. Haiku is recommended for cost efficiency.
-- **assessmentApiKey.keychainKey**: Keychain entry name storing the API key. Never stored in config directly.
-- **assessmentPrompt**: LLM prompt for assessing session status. Customizable.
+- **summaryModel**: LLM used for all session summarization. Haiku is recommended for cost efficiency.
+- **summaryApiKey.keychainKey**: Keychain entry name storing the API key. Never stored in config directly.
+- **summaryPrompt**: LLM prompt for summarizing session status. Customizable.
 - **pricing**: Optional. Per-million token costs (in dollars) for cost estimation in `wip stats`.
 - **indexRefreshThreshold**: Seconds before index is considered stale (informational; does not trigger automatic scan).
 
-## 11. Assessment Logic
+## 11. Summary Logic
 
 ### Two-Phase Strategy
 
@@ -424,8 +424,8 @@ For each session file:
 5. Build context block: first user message + last 5-10 user messages + last 5 assistant responses
 6. Estimate token count (1 token ≈ 4 chars); truncate aggressively if over threshold (~500 tokens)
 
-#### Phase 2: LLM Assessment
-Send pre-filtered context to the configured assessment model:
+#### Phase 2: LLM Summarization
+Send pre-filtered context to the configured summary model:
 
 ```
 Analyze this session and provide:
@@ -442,7 +442,7 @@ summary: [text]
 left_off: [text]
 ```
 
-**Token tracking**: Capture `usage` from LLM response. Store per-session (`assessment.inputTokens`, `assessment.outputTokens`) and aggregate in `tokenUsageStats`.
+**Token tracking**: Capture `usage` from LLM response. Store per-session (`summary.inputTokens`, `summary.outputTokens`) and aggregate in `tokenUsageStats`.
 
 ### Skip Conditions
 - File mtime ≤ last scanned mtime → skip (cached result is current)
@@ -456,6 +456,6 @@ left_off: [text]
 
 ### Edge Cases
 - Empty JSONL → skip
-- Malformed JSONL → log error, retain previous assessment if one exists
-- LLM API failure → retain previous assessment, retry on next scan
+- Malformed JSONL → log error, retain previous summary if one exists
+- LLM API failure → retain previous summary, retry on next scan
 - File deleted since last scan → remove from index

@@ -1,11 +1,13 @@
-// Scan mode: discovers Claude Code session files, assesses new/modified ones
+// Scan mode: discovers Claude Code session files, summarizes new/modified ones
 // with an LLM, updates the index, and prunes stale entries. Designed to run
 // unattended (e.g. via cron) and exit silently.
 
 pub mod jsonl_parser;
-pub mod lm_assessment;
+pub mod lm_summarizer;
 
+use crate::config::{Config, SummaryBackend};
 use crate::index::{index_path, Index, SessionEntry};
+use lm_summarizer::SummarizerConfig;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,8 +73,7 @@ const MAX_AGE_DAYS: i64 = 30;
 const MIN_AGE_SECS: i64 = 30;
 
 pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
+    let summarizer_config = build_summarizer_config()?;
 
     let path = index_path();
     let mut index = Index::load(&path)?;
@@ -83,7 +84,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|r| r.ok())
         .collect();
 
-    let mut assessments_run = 0u32;
+    let mut summaries_run = 0u32;
     let mut input_tokens_total = 0u32;
     let mut output_tokens_total = 0u32;
 
@@ -98,7 +99,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // Don't assess very old sessions — they're unlikely to be returned to
+        // Don't summarize very old sessions — they're unlikely to be returned to
         if now - file_mtime > MAX_AGE_DAYS * 86400 {
             continue;
         }
@@ -121,31 +122,31 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        eprintln!("Assessing: {}", session_id);
+        eprintln!("Summarizing: {}", session_id);
 
         let context = match jsonl_parser::parse_and_extract(&file) {
             Ok(c) => c,
             Err(e) => { eprintln!("  Parse error: {}", e); continue; }
         };
 
-        let assessment = match lm_assessment::assess(&context, &api_key).await {
-            Ok(a) => a,
-            Err(e) => { eprintln!("  Assessment error: {}", e); continue; }
+        let result = match lm_summarizer::summarize(&context, &summarizer_config).await {
+            Ok(r) => r,
+            Err(e) => { eprintln!("  Summary error: {}", e); continue; }
         };
 
-        input_tokens_total += assessment.input_tokens;
-        output_tokens_total += assessment.output_tokens;
-        assessments_run += 1;
+        input_tokens_total += result.input_tokens;
+        output_tokens_total += result.output_tokens;
+        summaries_run += 1;
 
         index.upsert(SessionEntry {
             path: path_str,
             session_id,
             provider: "claude-code".to_string(),
-            status: assessment.status,
+            status: result.status,
             file_modified_at: file_mtime,
             last_scanned_at: now,
-            summary: assessment.summary,
-            left_off: assessment.left_off,
+            summary: result.summary,
+            left_off: result.left_off,
             cwd: context.cwd,
         });
     }
@@ -170,7 +171,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let total_tokens = input_tokens_total + output_tokens_total;
     let log_entry = serde_json::json!({
         "timestamp": timestamp_str(),
-        "assessments_run": assessments_run,
+        "summaries_run": summaries_run,
         "in_progress": in_progress,
         "done": done,
         "pruned": pruned,
@@ -184,4 +185,41 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{}", log_entry);
 
     Ok(())
+}
+
+/// Builds the summarizer config from ~/.wip/config.json, falling back to the
+/// ANTHROPIC_API_KEY env var with the default model when no config file exists.
+fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Error>> {
+    match Config::load() {
+        Ok(config) => {
+            let model = config.scan.summary_model.clone();
+            match config.scan.summary_backend {
+                SummaryBackend::Vertex => {
+                    let project_id = config
+                        .scan
+                        .vertex_project_id
+                        .ok_or("vertex backend requires vertex_project_id in config")?;
+                    let region = config
+                        .scan
+                        .vertex_region
+                        .unwrap_or_else(|| "us-east5".to_string());
+                    Ok(SummarizerConfig::Vertex { project_id, region, model })
+                }
+                SummaryBackend::Anthropic => {
+                    let api_key = std::env::var("ANTHROPIC_API_KEY")
+                        .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
+                    Ok(SummarizerConfig::Anthropic { api_key, model })
+                }
+            }
+        }
+        // No config file — fall back to env var with default model
+        Err(_) => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
+            Ok(SummarizerConfig::Anthropic {
+                api_key,
+                model: "claude-sonnet-4-6".to_string(),
+            })
+        }
+    }
 }

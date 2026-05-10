@@ -16,7 +16,7 @@ The index is pre-computed, so the picker is always instant. Run `wip scan` on a 
 ## Requirements
 
 - [fzf](https://github.com/junegunn/fzf) — `brew install fzf`
-- An Anthropic API key (for session assessment)
+- An Anthropic API key **or** Google Cloud credentials via Vertex AI (see [Configuration](#configuration))
 - [Rust](https://rustup.rs/) (to build from source)
 
 ## Installation
@@ -49,7 +49,7 @@ wip scan
 ```bash
 wip               # Open session picker
 wip scan          # Scan for new/updated sessions
-wip scan --force  # Re-assess all sessions
+wip scan --force  # Re-summarize all sessions
 ```
 
 ### Recommended: run scan on a cron schedule
@@ -87,6 +87,44 @@ Type to fuzzy-filter. Press Enter to resume the selected session. The screen cle
 ├── index.json        # Session index with pre-computed summaries
 └── scan.log.jsonl    # Scan history (one JSON entry per run)
 ```
+
+## Configuration
+
+wip reads `~/.wip/config.json` if present. Without a config file it falls back to `ANTHROPIC_API_KEY` and the default model.
+
+### Vertex AI backend
+
+If you authenticate via Google Cloud (enterprise accounts, GCP billing), you can use Claude through Vertex AI instead of a direct Anthropic API key.
+
+**Prerequisites:** install the [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) and run:
+
+```bash
+gcloud auth application-default login
+```
+
+**Config (`~/.wip/config.json`):**
+
+```json
+{
+  "scan": {
+    "summary_backend": "vertex",
+    "vertex_project_id": "my-gcp-project",
+    "vertex_region": "us-east5",
+    "summary_model": "claude-sonnet-4-6"
+  }
+}
+```
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `summary_backend` | no | `"anthropic"` | `"anthropic"` or `"vertex"` |
+| `vertex_project_id` | when using vertex | — | GCP project ID |
+| `vertex_region` | no | `"us-east5"` | Vertex AI region |
+| `summary_model` | no | `"claude-sonnet-4-6"` | Model name (Anthropic format; translated to Vertex format automatically) |
+
+Model names are translated automatically — for example `claude-sonnet-4-6` becomes `claude-sonnet-4-6@20250514` on Vertex. If you need a specific version, set `summary_model` to the full Vertex model ID (e.g. `claude-sonnet-4-6@20250514`) and it will be used as-is.
+
+No API key is stored or needed when using the Vertex backend — credentials come from ADC (`gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`).
 
 ## Status
 

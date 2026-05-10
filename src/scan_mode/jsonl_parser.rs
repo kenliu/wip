@@ -1,6 +1,6 @@
 // Parses Claude Code JSONL session files and extracts a minimal context block
-// for LLM assessment. The goal is to send as few tokens as possible while
-// giving the assessor enough signal to determine status and summarize the work.
+// for LLM summarization. The goal is to send as few tokens as possible while
+// giving the summarizer enough signal to determine status and summarize the work.
 //
 // Claude Code JSONL format: one JSON object per line. Each record has a "type"
 // field. We care about "user" and "assistant" records, which carry a "message"
@@ -111,7 +111,7 @@ fn extract_assistant_content(v: &Value) -> Option<String> {
     if text.is_empty() { None } else { Some(truncate(&text, 1000)) }
 }
 
-// Builds the context string sent to the assessment LLM. Includes the first
+// Builds the context string sent to the summarizer LLM. Includes the first
 // message for topic context and the recent tail for status/left-off signal.
 pub fn build_context(ctx: &ExtractedContext) -> String {
     let mut parts = vec![format!("First message: {}", ctx.first_message)];

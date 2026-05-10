@@ -25,11 +25,29 @@ pub struct CliLauncher {
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryBackend {
+    #[default]
+    Anthropic,
+    Vertex,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ScanConfig {
-    pub assessment_model: String,
-    pub assessment_api_key: KeychainEntry,
-    pub assessment_prompt: String,
+    pub summary_model: String,
+    // Not needed for the Vertex backend (credentials come from ADC)
+    #[serde(default)]
+    pub summary_api_key: Option<KeychainEntry>,
+    #[serde(default)]
+    pub summary_backend: SummaryBackend,
+    // Required when summary_backend is "vertex"
+    #[serde(default)]
+    pub vertex_project_id: Option<String>,
+    // Vertex region, e.g. "us-east5". Defaults to "us-east5" if not set.
+    #[serde(default)]
+    pub vertex_region: Option<String>,
+    pub summary_prompt: String,
     #[serde(default)]
     pub pricing: Option<Pricing>,
 }
@@ -55,7 +73,8 @@ fn default_refresh_threshold() -> u64 {
 
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let config_path = PathBuf::from("~/.wip/config.json").canonicalize()?;
+        let home = dirs::home_dir().ok_or("Could not find home directory")?;
+        let config_path: PathBuf = home.join(".wip/config.json");
         let content = std::fs::read_to_string(config_path)?;
         let config = serde_json::from_str(&content)?;
         Ok(config)

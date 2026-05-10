@@ -16,7 +16,7 @@ pub struct SessionEntry {
     // Unix timestamps — i64 to match filesystem mtime values
     pub file_modified_at: i64,
     pub last_scanned_at: i64,
-    // LLM-generated fields from assessment
+    // LLM-generated fields from summarization
     pub summary: String,
     pub left_off: String,
     // Working directory at the time the session was active; used to cd before resuming

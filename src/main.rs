@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod config;
 mod index;
 mod install_mode;
 mod scan_mode;
@@ -15,7 +16,7 @@ struct Cli {
 
 #[derive(Parser)]
 enum Command {
-    /// Scan filesystem for sessions and assess their state
+    /// Scan filesystem for sessions and summarize their state
     Scan {
         #[arg(long)]
         force: bool,
