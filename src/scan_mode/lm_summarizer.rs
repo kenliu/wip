@@ -136,10 +136,24 @@ async fn summarize_vertex(
     model: &str,
 ) -> Result<SummaryResponse, Box<dyn std::error::Error>> {
     let token = get_gcloud_token()?;
-    let vertex_model = to_vertex_model(model);
+    // Global endpoint accepts plain Anthropic model names (e.g. "claude-sonnet-4-6").
+    // Regional endpoints require versioned IDs (e.g. "claude-sonnet-4-6@20250514").
+    let vertex_model = if region == "global" {
+        model.to_string()
+    } else {
+        to_vertex_model(model)
+    };
 
+    // The global endpoint uses a different hostname than regional ones.
+    // Regional: {region}-aiplatform.googleapis.com
+    // Global:   aiplatform.googleapis.com
+    let host = if region == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{region}-aiplatform.googleapis.com")
+    };
     let url = format!(
-        "https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{vertex_model}:rawPredict"
+        "https://{host}/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{vertex_model}:rawPredict"
     );
 
     let client = reqwest::Client::new();
