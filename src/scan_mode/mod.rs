@@ -259,13 +259,6 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
     let choice = prompt("Choice [1]: ")?;
     let use_vertex = choice.trim() == "2";
 
-    let model_input = prompt("Model [claude-sonnet-4-6]: ")?;
-    let model = if model_input.trim().is_empty() {
-        "claude-sonnet-4-6".to_string()
-    } else {
-        model_input.trim().to_string()
-    };
-
     let scan = if use_vertex {
         let project_input = prompt("GCP project ID: ")?;
         let project_id = project_input.trim().to_string();
@@ -280,7 +273,6 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
         };
         ScanConfig {
             summary_backend: SummaryBackend::Vertex,
-            summary_model: model,
             vertex_project_id: Some(project_id),
             vertex_region: Some(region),
             ..Default::default()
@@ -288,7 +280,6 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
     } else {
         ScanConfig {
             summary_backend: SummaryBackend::Anthropic,
-            summary_model: model,
             ..Default::default()
         }
     };
@@ -304,6 +295,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
     eprintln!("\nCreated {}.", config_path.display());
 
     if use_vertex {
+        eprintln!("Using model: claude-sonnet-4-6 (edit summary_model in config to change)");
         eprintln!("If you haven't already, authenticate with GCP:");
         eprintln!("  gcloud auth application-default login");
     } else {
