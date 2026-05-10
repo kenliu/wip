@@ -5,7 +5,7 @@
 pub mod jsonl_parser;
 pub mod lm_summarizer;
 
-use crate::config::{Config, SummaryBackend};
+use crate::config::{config_path, Config, ScanConfig, SummaryBackend};
 use crate::index::{index_path, Index, SessionEntry};
 use lm_summarizer::SummarizerConfig;
 use std::io::Write;
@@ -131,7 +131,17 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
         let result = match lm_summarizer::summarize(&context, &summarizer_config).await {
             Ok(r) => r,
-            Err(e) => { eprintln!("  Summary error: {}", e); continue; }
+            Err(e) => {
+                let msg = e.to_string();
+                // 4xx errors indicate a configuration problem (bad key, wrong model,
+                // wrong project) that will fail identically for every session — abort
+                // rather than spamming the same error for every remaining file.
+                if is_fatal_api_error(&msg) {
+                    return Err(format!("Scan aborted: {}", msg).into());
+                }
+                eprintln!("  Summary error: {}", e);
+                continue;
+            }
         };
 
         input_tokens_total += result.input_tokens;
@@ -187,58 +197,146 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const SETUP_GUIDE: &str = "\
-wip is not configured. Set up a Claude API connection to get started:
-
-  Option 1 — Anthropic API key (simplest):
-    export ANTHROPIC_API_KEY=sk-ant-...
-    Add to ~/.zshrc or ~/.bashrc to make it permanent.
-
-  Option 2 — Google Cloud Vertex AI:
-    Create ~/.wip/config.json:
-    {
-      \"scan\": {
-        \"summary_backend\": \"vertex\",
-        \"vertex_project_id\": \"your-gcp-project\",
-        \"summary_model\": \"claude-sonnet-4-6\"
-      }
-    }
-    Then run: gcloud auth application-default login
-
-Then run: wip scan";
-
-/// Builds the summarizer config from ~/.wip/config.json, falling back to the
-/// ANTHROPIC_API_KEY env var with the default model when no config file exists.
+/// Builds the summarizer config, running an interactive setup wizard to create
+/// ~/.wip/config.json if it doesn't exist and stdin is a terminal.
 fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Error>> {
-    match Config::load() {
-        Ok(config) => {
-            let model = config.scan.summary_model.clone();
-            match config.scan.summary_backend {
-                SummaryBackend::Vertex => {
-                    let project_id = config
-                        .scan
-                        .vertex_project_id
-                        .ok_or("vertex backend requires vertex_project_id in config")?;
-                    let region = config
-                        .scan
-                        .vertex_region
-                        .unwrap_or_else(|| "us-east5".to_string());
-                    Ok(SummarizerConfig::Vertex { project_id, region, model })
-                }
-                SummaryBackend::Anthropic => {
-                    let api_key = std::env::var("ANTHROPIC_API_KEY")
-                        .map_err(|_| "ANTHROPIC_API_KEY is not set. Add it to your shell profile or set it in the current shell.")?;
-                    Ok(SummarizerConfig::Anthropic { api_key, model })
-                }
-            }
+    let path = config_path();
+
+    if !path.exists() {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            run_setup_wizard(&path)?;
+        } else {
+            // Non-interactive (cron, pipe): fall back to env var or show setup guide
+            return match std::env::var("ANTHROPIC_API_KEY") {
+                Ok(api_key) if !api_key.is_empty() => Ok(SummarizerConfig::Anthropic {
+                    api_key,
+                    model: "claude-sonnet-4-6".to_string(),
+                }),
+                _ => Err(setup_guide().into()),
+            };
         }
-        // No config file and no API key — show the full setup guide
-        Err(_) => match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(api_key) => Ok(SummarizerConfig::Anthropic {
-                api_key,
-                model: "claude-sonnet-4-6".to_string(),
-            }),
-            Err(_) => Err(SETUP_GUIDE.into()),
-        },
     }
+
+    let config = Config::load()
+        .map_err(|e| format!("Failed to load {}: {}", path.display(), e))?;
+
+    let model = config.scan.summary_model.clone();
+    match config.scan.summary_backend {
+        SummaryBackend::Vertex => {
+            let project_id = config
+                .scan
+                .vertex_project_id
+                .ok_or("vertex backend requires vertex_project_id in config")?;
+            let region = config
+                .scan
+                .vertex_region
+                .unwrap_or_else(|| "us-east5".to_string());
+            Ok(SummarizerConfig::Vertex { project_id, region, model })
+        }
+        SummaryBackend::Anthropic => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                "wip: ANTHROPIC_API_KEY is not set.\n\n\
+                 Add it to your shell profile and re-run:\n\
+                 \n  export ANTHROPIC_API_KEY=sk-ant-..."
+            })?;
+            if api_key.is_empty() {
+                return Err("wip: ANTHROPIC_API_KEY is set but empty. Set it to a valid API key.".into());
+            }
+            Ok(SummarizerConfig::Anthropic { api_key, model })
+        }
+    }
+}
+
+/// Prompts the user for configuration, writes ~/.wip/config.json, and prints
+/// next-step instructions. Returns an error only if the wizard itself fails.
+fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("wip is not configured. Let's set up your Claude API connection.\n");
+    eprintln!("Which backend would you like to use?");
+    eprintln!("  1) Anthropic API key");
+    eprintln!("  2) Google Cloud Vertex AI");
+
+    let choice = prompt("Choice [1]: ")?;
+    let use_vertex = choice.trim() == "2";
+
+    let model_input = prompt("Model [claude-sonnet-4-6]: ")?;
+    let model = if model_input.trim().is_empty() {
+        "claude-sonnet-4-6".to_string()
+    } else {
+        model_input.trim().to_string()
+    };
+
+    let scan = if use_vertex {
+        let project_input = prompt("GCP project ID: ")?;
+        let project_id = project_input.trim().to_string();
+        if project_id.is_empty() {
+            return Err("GCP project ID is required for the Vertex backend.".into());
+        }
+        let region_input = prompt("Region [us-east5]: ")?;
+        let region = if region_input.trim().is_empty() {
+            "us-east5".to_string()
+        } else {
+            region_input.trim().to_string()
+        };
+        ScanConfig {
+            summary_backend: SummaryBackend::Vertex,
+            summary_model: model,
+            vertex_project_id: Some(project_id),
+            vertex_region: Some(region),
+            ..Default::default()
+        }
+    } else {
+        ScanConfig {
+            summary_backend: SummaryBackend::Anthropic,
+            summary_model: model,
+            ..Default::default()
+        }
+    };
+
+    let config = Config {
+        scan,
+        providers: std::collections::HashMap::new(),
+        storage_dir: "~/.wip".to_string(),
+        index_refresh_threshold: 3600,
+    };
+    config.save(&config_path.to_path_buf())?;
+
+    eprintln!("\nCreated {}.", config_path.display());
+
+    if use_vertex {
+        eprintln!("If you haven't already, authenticate with GCP:");
+        eprintln!("  gcloud auth application-default login");
+    } else {
+        eprintln!("Set your Anthropic API key, then run `wip scan`:");
+        eprintln!("  export ANTHROPIC_API_KEY=sk-ant-...");
+    }
+    eprintln!();
+
+    Ok(())
+}
+
+fn prompt(text: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    print!("{}", text);
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
+fn setup_guide() -> &'static str {
+    "wip is not configured. Set up a Claude API connection to get started:\n\
+     \n  Option 1 — Anthropic API key (simplest):\n\
+     \n    export ANTHROPIC_API_KEY=sk-ant-...\n\
+     \n    Add to ~/.zshrc or ~/.bashrc to make it permanent.\n\
+     \n  Option 2 — Google Cloud Vertex AI:\n\
+     \n    Run `wip scan` in a terminal to be guided through setup.\n\
+     \nThen run: wip scan"
+}
+
+/// Returns true for API errors that will affect every session and should abort
+/// the scan rather than be logged per-file. 4xx = client/config error,
+/// 5xx = server unavailable — both are systemic, not file-specific.
+fn is_fatal_api_error(msg: &str) -> bool {
+    msg.contains("API error 4") || msg.contains("API error 5")
 }

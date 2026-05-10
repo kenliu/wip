@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     pub scan: ScanConfig,
     #[serde(default = "default_storage_dir")]
@@ -33,8 +34,9 @@ pub enum SummaryBackend {
     Vertex,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ScanConfig {
+    #[serde(default = "default_model")]
     pub summary_model: String,
     // Not needed for the Vertex backend (credentials come from ADC)
     #[serde(default)]
@@ -47,6 +49,8 @@ pub struct ScanConfig {
     // Vertex region, e.g. "us-east5". Defaults to "us-east5" if not set.
     #[serde(default)]
     pub vertex_region: Option<String>,
+    // LLM prompt template; empty means use the built-in default
+    #[serde(default)]
     pub summary_prompt: String,
     #[serde(default)]
     pub pricing: Option<Pricing>,
@@ -71,16 +75,27 @@ fn default_refresh_threshold() -> u64 {
     3600
 }
 
+fn default_model() -> String {
+    "claude-sonnet-4-6".to_string()
+}
+
+pub fn config_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not find home directory")
+        .join(".wip/config.json")
+}
+
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let home = dirs::home_dir().ok_or("Could not find home directory")?;
-        let config_path: PathBuf = home.join(".wip/config.json");
-        let content = std::fs::read_to_string(config_path)?;
+        let content = std::fs::read_to_string(config_path())?;
         let config = serde_json::from_str(&content)?;
         Ok(config)
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
