@@ -122,6 +122,8 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let continuation = jsonl_parser::is_continuation_session(&file);
+
         eprintln!("Summarizing: {}", session_id);
 
         let context = match jsonl_parser::parse_and_extract(&file) {
@@ -158,6 +160,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             summary: result.summary,
             left_off: result.left_off,
             cwd: context.cwd,
+            continuation,
         });
     }
 

@@ -95,6 +95,31 @@ Keep comments concise — one line is usually enough. Don't restate what the cod
 3. Test with real JSONL files from Claude Code and OpenCode
 4. Config/index should be easily inspectable (human-readable JSON, pretty-printed)
 
+## Claude Code JSONL Session File Format
+
+Claude Code writes one JSON object per line. Known record types:
+
+- `permission-mode` — first record in a normal user-initiated session
+- `file-history-snapshot` — file state snapshot, written by Claude Code
+- `user` / `assistant` — conversation messages (the records we care about)
+- `system` — system-level messages, not part of the user conversation
+- `attachment` — file attachments added to the conversation
+- `progress` — sub-agent progress events
+- `last-prompt` — records the last prompt the user typed; written at session end
+- `pr-link` — written when a PR is created during a session; contains `prNumber`, `prUrl`, `prRepository`
+- `agent-setting` — first record in sessions spawned as named agents (filenames also start with `agent-`)
+- `queue-operation` — first record in sessions spawned automatically by Claude Code for background tasks (e.g. generating thread titles, injecting prior conversation context). These are **not user-initiated**.
+
+### `isSidechain` and Sub-agent Sessions
+
+Records with `"isSidechain": true` appear only inside `agent-*` files, never in main session files. They reference their parent session via the `sessionId` field. Since `wip` already skips `agent-*` files by filename, sidechain records never reach the parser — no special handling needed.
+
+### `queue-operation` Sessions
+
+When the first record has `"type": "queue-operation"`, the session was spawned automatically, not by the user directly. The `content` field may embed prior conversation history as `<conversation_history>` text, but there is **no parent session ID field** — the link is implicit text only. Each queue-operation session has its own new UUID with no explicit reference back to the session it continues from.
+
+`wip` sets `continuation: true` on these sessions in the index and deduplicates them in `in_progress_sessions()`: only the most recent continuation session per cwd is shown, and non-continuation sessions are always shown regardless.
+
 ## Testing Approach
 
 - Unit tests for JSONL parsing and token counting (most critical)

@@ -21,6 +21,10 @@ pub struct SessionEntry {
     pub left_off: String,
     // Working directory at the time the session was active; used to cd before resuming
     pub cwd: Option<String>,
+    // True for sessions that were started via queue-operation (automated continuations).
+    // These are chained sessions where only the latest per cwd is worth showing.
+    #[serde(default)]
+    pub continuation: bool,
 }
 
 pub fn index_path() -> PathBuf {
@@ -59,6 +63,18 @@ impl Index {
         // Most recently modified first — these are the sessions the user is most
         // likely to want to return to
         sessions.sort_by(|a, b| b.file_modified_at.cmp(&a.file_modified_at));
+
+        // For continuation chains, only show the most recent session per cwd.
+        // Since we sorted by recency, the first continuation we see for a given
+        // cwd is the latest — subsequent ones are older steps in the same chain.
+        let mut seen_continuation_cwds = std::collections::HashSet::new();
+        sessions.retain(|s| {
+            if s.continuation {
+                seen_continuation_cwds.insert(s.cwd.as_deref().unwrap_or("").to_string())
+            } else {
+                true
+            }
+        });
         sessions
     }
 

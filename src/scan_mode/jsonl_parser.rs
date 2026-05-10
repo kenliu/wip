@@ -9,6 +9,7 @@
 // thinking, tool_use, etc). All other record types are ignored.
 
 use serde_json::Value;
+use std::io::BufRead;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,21 @@ pub struct ExtractedContext {
     pub recent_messages: Vec<(String, String)>, // (role, content)
     // Working directory from the session file, used to resume in the right directory
     pub cwd: Option<String>,
+}
+
+/// Returns true if this session was started via a queue-operation (an automated
+/// continuation). These sessions embed prior conversation history and are part of
+/// a chain — only the latest in the chain is relevant to the user.
+pub fn is_continuation_session(path: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    for line in std::io::BufReader::new(f).lines().take(5) {
+        let Ok(line) = line else { continue };
+        let line = line.trim();
+        if line.is_empty() { continue }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        return v.get("type").and_then(|t| t.as_str()) == Some("queue-operation");
+    }
+    false
 }
 
 pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::error::Error>> {
