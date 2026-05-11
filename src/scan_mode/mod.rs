@@ -185,9 +185,11 @@ pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Er
     let before = index.sessions.len();
     index.sessions.retain(|s| {
         if s.session_id.starts_with("agent-") { return false; }
-        if now - s.file_modified_at > MAX_AGE_DAYS * 86400 { return false; }
-        // Remove sessions whose files have been deleted
+        // Files that no longer exist can't be resumed regardless of flag state
         if !std::path::Path::new(&s.path).exists() { return false; }
+        // Flagged sessions are kept indefinitely — the user explicitly marked them
+        if s.flagged { return true; }
+        if now - s.file_modified_at > MAX_AGE_DAYS * 86400 { return false; }
         true
     });
     let pruned = before - index.sessions.len();
