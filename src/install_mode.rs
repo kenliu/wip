@@ -4,8 +4,11 @@
 // The plist is installed to ~/Library/LaunchAgents/ and loaded immediately.
 // launchd will then run `wip scan` every 10 minutes, keeping the index fresh.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+
+use crate::config::{Config, SummaryBackend};
 
 const LABEL: &str = "com.kenliu.wip";
 const INTERVAL_SECS: u32 = 600; // 10 minutes
@@ -24,7 +27,22 @@ fn log_path() -> PathBuf {
         .join("launchd.log")
 }
 
-fn generate_plist(wip_bin: &str, api_key: &str, log_file: &str) -> String {
+fn generate_plist(wip_bin: &str, env_vars: &HashMap<String, String>, log_file: &str) -> String {
+    // Build the EnvironmentVariables block only if there are vars to embed.
+    // launchd agents don't inherit the shell environment, so any required env
+    // vars must be explicitly set here.
+    let env_block = if env_vars.is_empty() {
+        String::new()
+    } else {
+        let entries: String = env_vars
+            .iter()
+            .map(|(k, v)| format!("        <key>{k}</key>\n        <string>{v}</string>\n"))
+            .collect();
+        format!(
+            "\n    <key>EnvironmentVariables</key>\n    <dict>\n{entries}    </dict>\n"
+        )
+    };
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -42,15 +60,7 @@ fn generate_plist(wip_bin: &str, api_key: &str, log_file: &str) -> String {
     <!-- Run every {interval} seconds -->
     <key>StartInterval</key>
     <integer>{interval}</integer>
-
-    <!-- Embed API key since launchd agents don't inherit shell environment.
-         Replace with keychain integration once issue #5 is implemented. -->
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>ANTHROPIC_API_KEY</key>
-        <string>{api_key}</string>
-    </dict>
-
+{env_block}
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -65,7 +75,7 @@ fn generate_plist(wip_bin: &str, api_key: &str, log_file: &str) -> String {
         label = LABEL,
         bin = wip_bin,
         interval = INTERVAL_SECS,
-        api_key = api_key,
+        env_block = env_block,
         log = log_file,
     )
 }
@@ -96,10 +106,35 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     let wip_bin = input.trim().to_string();
     let wip_bin = if wip_bin.is_empty() { suggested_bin } else { wip_bin };
 
-    // Embed the current API key — launchd agents don't inherit shell environment.
-    // This will be replaced by keychain lookup once issue #5 is implemented.
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY is not set. Set it before running wip install.")?;
+    // Load config to determine which auth backend is in use.
+    // If config doesn't exist yet, fall back to Anthropic behavior.
+    let backend = Config::load()
+        .map(|c| c.scan.summary_backend)
+        .unwrap_or_default();
+
+    // Build the env vars to embed in the plist. launchd agents don't inherit
+    // the shell environment, so required credentials must be set explicitly.
+    let mut env_vars: HashMap<String, String> = HashMap::new();
+    match backend {
+        SummaryBackend::Anthropic => {
+            // Embed the API key — will be replaced by keychain once issue #5 is done.
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| "ANTHROPIC_API_KEY is not set. Set it before running wip install.")?;
+            env_vars.insert("ANTHROPIC_API_KEY".to_string(), api_key);
+        }
+        SummaryBackend::Vertex => {
+            // Vertex uses Application Default Credentials (ADC). The credential
+            // file lives at a well-known path (~/.config/gcloud/...) so launchd
+            // can find it without an explicit env var. We do forward
+            // GOOGLE_APPLICATION_CREDENTIALS if the user has set it to a
+            // non-default location.
+            if let Ok(creds) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+                env_vars.insert("GOOGLE_APPLICATION_CREDENTIALS".to_string(), creds);
+            }
+            println!("Vertex backend detected — using Application Default Credentials (ADC).");
+            println!("Make sure 'gcloud auth application-default login' has been run on this machine.");
+        }
+    }
 
     // Ensure ~/.wip/ exists for the log file
     if let Some(parent) = log_path.parent() {
@@ -111,7 +146,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let plist = generate_plist(&wip_bin, &api_key, &log_path.to_string_lossy());
+    let plist = generate_plist(&wip_bin, &env_vars, &log_path.to_string_lossy());
     std::fs::write(&plist_path, &plist)?;
     println!("Wrote plist to {}", plist_path.display());
 
@@ -126,9 +161,11 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Installed and loaded. wip scan will run every {} minutes.", INTERVAL_SECS / 60);
     println!("Logs: {}", log_path.display());
-    println!();
-    println!("Note: the API key is embedded in the plist in plaintext.");
-    println!("This will be replaced by keychain storage in a future release (issue #5).");
+    if backend == SummaryBackend::Anthropic {
+        println!();
+        println!("Note: the API key is embedded in the plist in plaintext.");
+        println!("This will be replaced by keychain storage in a future release (issue #5).");
+    }
 
     Ok(())
 }
