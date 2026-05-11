@@ -6,7 +6,7 @@ pub mod jsonl_parser;
 pub mod lm_summarizer;
 
 use crate::config::{config_path, Config, ScanConfig, SummaryBackend};
-use crate::index::{index_path, Index, SessionEntry};
+use crate::index::{acquire_lock, index_path, Index, SessionEntry};
 use lm_summarizer::SummarizerConfig;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,9 +72,10 @@ fn append_log(msg: &str) {
 const MAX_AGE_DAYS: i64 = 30;
 const MIN_AGE_SECS: i64 = 30;
 
-pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Error>> {
     let summarizer_config = build_summarizer_config()?;
 
+    let _lock = acquire_lock()?;
     let path = index_path();
     let mut index = Index::load(&path)?;
     let now = now();
@@ -128,10 +129,13 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             Ok(c) => c,
             // "No messages found" means the session was created but never used — skip silently
             Err(e) if e.to_string() == "No messages found" => continue,
-            Err(e) => { eprintln!("  Parse error {}: {}", session_id, e); continue; }
+            Err(e) => {
+                if !silent { eprintln!("  Parse error {}: {}", session_id, e); }
+                continue;
+            }
         };
 
-        eprintln!("Summarizing: {}", session_id);
+        if !silent { eprintln!("Summarizing: {}", session_id); }
 
         let result = match lm_summarizer::summarize(&context, &summarizer_config).await {
             Ok(r) => r,
@@ -143,7 +147,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 if is_fatal_api_error(&msg) {
                     return Err(format!("Scan aborted: {}", msg).into());
                 }
-                eprintln!("  Summary error: {}", e);
+                if !silent { eprintln!("  Summary error: {}", e); }
                 continue;
             }
         };
@@ -151,6 +155,8 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         input_tokens_total += result.input_tokens;
         output_tokens_total += result.output_tokens;
         summaries_run += 1;
+
+        let file_size_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
 
         index.upsert(SessionEntry {
             path: path_str,
@@ -164,6 +170,11 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             cwd: context.cwd,
             continuation,
             last_prompt: context.last_prompt,
+            manually_done: false,
+            flagged: false,
+            custom_title: context.custom_title,
+            file_size_bytes,
+            turn_count: context.turn_count,
         });
     }
 
@@ -199,7 +210,7 @@ pub async fn run(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     append_log(&log_entry.to_string());
-    eprintln!("{}", log_entry);
+    if !silent { eprintln!("{}", log_entry); }
 
     Ok(())
 }
