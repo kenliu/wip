@@ -175,6 +175,8 @@ pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Er
             custom_title: context.custom_title,
             file_size_bytes,
             turn_count: context.turn_count,
+            message_count: context.message_count,
+            duration_secs: context.duration_secs,
         });
     }
 

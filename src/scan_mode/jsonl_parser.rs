@@ -22,8 +22,12 @@ pub struct ExtractedContext {
     pub last_prompt: Option<String>,
     // User-assigned name from the `/rename` command, stored in `custom-title` records
     pub custom_title: Option<String>,
-    // Total number of user turns in the session (before tail truncation)
+    // Number of user turns in the session
     pub turn_count: u32,
+    // Total user + assistant messages with extractable text
+    pub message_count: u32,
+    // Duration from first to last timestamped record, in seconds
+    pub duration_secs: Option<i64>,
 }
 
 /// Returns true if this session was started via a queue-operation (an automated
@@ -47,6 +51,8 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
     let mut cwd: Option<String> = None;
     let mut last_prompt: Option<String> = None;
     let mut custom_title: Option<String> = None;
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: Option<i64> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -62,6 +68,14 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
             if let Some(s) = v.get("cwd").and_then(|s| s.as_str()) {
                 cwd = Some(s.to_string());
             }
+        }
+
+        // Track session time span using the timestamp field present on most record types
+        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_iso8601_secs) {
+            if first_ts.is_none() {
+                first_ts = Some(ts);
+            }
+            last_ts = Some(ts);
         }
 
         match v.get("type").and_then(|t| t.as_str()) {
@@ -106,7 +120,50 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
     let recent_start = messages.len().saturating_sub(15);
     let recent_messages = messages[recent_start..].to_vec();
 
-    Ok(ExtractedContext { first_message, recent_messages, cwd, last_prompt, custom_title, turn_count })
+    let message_count = messages.len() as u32;
+    let duration_secs = match (first_ts, last_ts) {
+        (Some(first), Some(last)) if last > first => Some(last - first),
+        _ => None,
+    };
+
+    Ok(ExtractedContext { first_message, recent_messages, cwd, last_prompt, custom_title, turn_count, message_count, duration_secs })
+}
+
+// Parses "YYYY-MM-DDTHH:MM:SS[.mmm]Z" into a Unix timestamp (seconds).
+// Avoids a chrono dependency for this one narrow use case.
+fn parse_iso8601_secs(s: &str) -> Option<i64> {
+    let s = s.trim_end_matches('Z');
+    let (date_part, time_part) = s.split_once('T')?;
+
+    let mut d = date_part.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+
+    let time_no_frac = time_part.split('.').next()?;
+    let mut t = time_no_frac.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let min: i64 = t.next()?.parse().ok()?;
+    let sec: i64 = t.next()?.parse().ok()?;
+
+    let is_leap = |y: i64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days_in_month = |y: i64, m: i64| match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31i64,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap(y) { 29 } else { 28 },
+        _ => 0,
+    };
+
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        days += days_in_month(year, m);
+    }
+    days += day - 1;
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 fn extract_user_content(v: &Value) -> Option<String> {

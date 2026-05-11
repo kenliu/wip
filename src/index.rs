@@ -45,6 +45,12 @@ pub struct SessionEntry {
     // Number of user turns in the session
     #[serde(default)]
     pub turn_count: u32,
+    // Total user + assistant messages with extractable text
+    #[serde(default)]
+    pub message_count: u32,
+    // Duration from first to last timestamped record, in seconds
+    #[serde(default)]
+    pub duration_secs: Option<i64>,
 }
 
 pub fn index_path() -> PathBuf {
