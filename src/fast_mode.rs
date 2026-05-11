@@ -81,7 +81,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--no-sort",    // preserve recency order from the index
             "--reverse",    // most recent at the top
             "--prompt=wip > ",
-            "--height=50%",
+            "--height=100%",
             "--info=hidden",
         ])
         .stdin(Stdio::piped())
