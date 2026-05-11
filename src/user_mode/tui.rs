@@ -1,10 +1,8 @@
-use crate::index::SessionEntry;
+use crate::index::{acquire_lock, Index, SessionEntry};
 use std::collections::HashMap;
 
 pub enum TuiAction {
     Resume { session_id: String, cwd: Option<String> },
-    MarkDone { session_id: String, cursor: usize },
-    Flag { session_id: String, cursor: usize },
     Quit,
 }
 
@@ -57,18 +55,29 @@ fn project_name(cwd: &str) -> String {
         .unwrap_or_default()
 }
 
-// Returns the user-assigned title if set, otherwise the project directory name.
-fn session_display_name(session: &SessionEntry) -> String {
-    session.custom_title.clone()
-        .unwrap_or_else(|| project_name(session.cwd.as_deref().unwrap_or("")))
-}
-
 // ── Chat preview helpers ──────────────────────────────────────────────────────
 
 fn load_preview(path: &str) -> Vec<(String, String)> {
-    let Ok(content) = std::fs::read_to_string(path) else { return vec![] };
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return vec![] };
+
+    // Session files can be many MB — only read the tail
+    const TAIL_BYTES: u64 = 65_536;
+    let file_len = file.seek(SeekFrom::End(0)).unwrap_or(0);
+    let start = file_len.saturating_sub(TAIL_BYTES);
+    let _ = file.seek(SeekFrom::Start(start));
+
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf);
+
     let mut messages = Vec::new();
-    for line in content.lines() {
+    let mut lines = buf.lines();
+
+    // If we seeked into the middle of the file, the first line is likely a
+    // partial JSON record — skip it
+    if start > 0 { lines.next(); }
+
+    for line in lines {
         let line = line.trim();
         if line.is_empty() { continue; }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
@@ -167,43 +176,77 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-struct App<'a> {
-    sessions: &'a [&'a SessionEntry],
+struct App {
+    sessions: Vec<SessionEntry>,
+    index_path: std::path::PathBuf,
     selected: usize,
     filter: String,
     // When true, keyboard input goes to the filter string instead of navigation
     filter_mode: bool,
     // When true, only flagged sessions are shown
     flagged_only: bool,
+    // When true, the chat preview pane is shown (toggled with →/←)
+    show_preview: bool,
     // Keyed by session_id; populated lazily on first render of each session
     preview_cache: HashMap<String, Vec<(String, String)>>,
 }
 
-impl<'a> App<'a> {
-    fn new(sessions: &'a [&'a SessionEntry], initial_selected: usize) -> Self {
+impl App {
+    fn new(sessions: Vec<SessionEntry>, index_path: std::path::PathBuf, initial_selected: usize) -> Self {
         let selected = initial_selected.min(sessions.len().saturating_sub(1));
         Self {
             sessions,
+            index_path,
             selected,
             filter: String::new(),
             filter_mode: false,
             flagged_only: false,
+            show_preview: false,
             preview_cache: HashMap::new(),
         }
     }
 
     // Returns sessions matching the current filter and flagged_only mode.
-    fn filtered(&self) -> Vec<&'a SessionEntry> {
+    fn filtered(&self) -> Vec<&SessionEntry> {
         let q = self.filter.to_lowercase();
         self.sessions
             .iter()
-            .copied()
             .filter(|s| {
                 if self.flagged_only && !s.flagged { return false; }
-                if !q.is_empty() && !session_display_name(s).to_lowercase().contains(&q) { return false; }
+                if !q.is_empty() {
+                    let proj = project_name(s.cwd.as_deref().unwrap_or(""));
+                    let title = s.custom_title.as_deref().unwrap_or("");
+                    if !proj.to_lowercase().contains(&q) && !title.to_lowercase().contains(&q) { return false; }
+                }
                 true
             })
             .collect()
+    }
+
+    // Toggle flag on the selected session in-memory and persist to disk.
+    fn handle_flag(&mut self, session_id: &str) {
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            s.flagged = !s.flagged;
+        }
+        if let Ok(_lock) = acquire_lock() {
+            if let Ok(mut index) = Index::load(&self.index_path) {
+                index.toggle_flagged(session_id);
+                let _ = index.save(&self.index_path);
+            }
+        }
+        self.clamp_selected();
+    }
+
+    // Mark the selected session done in-memory and persist to disk.
+    fn handle_mark_done(&mut self, session_id: &str) {
+        self.sessions.retain(|s| s.session_id != session_id);
+        if let Ok(_lock) = acquire_lock() {
+            if let Ok(mut index) = Index::load(&self.index_path) {
+                index.mark_manually_done(session_id);
+                let _ = index.save(&self.index_path);
+            }
+        }
+        self.clamp_selected();
     }
 
     fn filtered_count(&self) -> usize {
@@ -251,7 +294,7 @@ impl<'a> App<'a> {
 
         self.render_header(frame, header_area);
 
-        if content_area.width >= 120 {
+        if self.show_preview && content_area.width >= 80 {
             let [left_area, right_area] = Layout::horizontal([
                 Constraint::Percentage(55),
                 Constraint::Percentage(45),
@@ -328,25 +371,41 @@ impl<'a> App<'a> {
                 };
 
                 let cursor = if is_selected { "▶" } else { " " };
-                let display_name = session_display_name(session);
+                let proj = project_name(session.cwd.as_deref().unwrap_or(""));
                 let age = format_age(session.file_modified_at);
                 let size = format_size(session.file_size_bytes);
 
-                // Row 1: cursor + display name + age + file size + turn count
+                // Row 1: cursor + project name + age + file size + turn count
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{} {:<21}", cursor, display_name), row_style),
+                    Span::styled(format!("{} {:<21}", cursor, proj), row_style),
                     Span::styled(format!("{:<10}", age), dim_style),
                     Span::styled(format!("{:<7}", size), dim_style),
                     Span::styled(format!("{}t", session.turn_count), dim_style),
                 ]));
 
-                // Row 2: flag (only if set) + topic summary
+                // Row 2: flag + optional custom title badge + topic summary
                 if lines.len() < list_height as usize {
-                    let flag_prefix = if session.flagged { "🚩 " } else { "" };
-                    let text = format!("  {}{}", flag_prefix, session.summary);
-                    let truncated: String =
-                        text.chars().take(max_width.saturating_sub(2)).collect();
-                    lines.push(Line::from(Span::styled(truncated, row_style)));
+                    let flag_str = if session.flagged { "🚩 " } else { "" };
+                    let indent = format!("  {}", flag_str);
+
+                    if let Some(title) = &session.custom_title {
+                        let badge = format!(" {} ", title);
+                        let badge_style = row_style.add_modifier(Modifier::REVERSED);
+                        let used = indent.chars().count() + badge.chars().count() + 1;
+                        let summary: String = session.summary.chars()
+                            .take(max_width.saturating_sub(used))
+                            .collect();
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(badge, badge_style),
+                            Span::styled(format!(" {}", summary), row_style),
+                        ]));
+                    } else {
+                        let text = format!("{}{}", indent, session.summary);
+                        let truncated: String =
+                            text.chars().take(max_width.saturating_sub(2)).collect();
+                        lines.push(Line::from(Span::styled(truncated, row_style)));
+                    }
                 }
 
                 // Row 3: left_off — last action or next step
@@ -428,6 +487,8 @@ impl<'a> App<'a> {
                     Span::styled(" flag   ", label_style),
                     Span::styled("F", key_style),
                     Span::styled(" flagged only   ", label_style),
+                    Span::styled("→/←", key_style),
+                    Span::styled(" preview   ", label_style),
                     Span::styled("q", key_style),
                     Span::styled(" quit", label_style),
                 ]))
@@ -445,13 +506,18 @@ impl<'a> App<'a> {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let filtered = self.filtered();
-        let Some(session) = filtered.get(self.selected).copied() else { return };
+        // Extract the key before dropping the filtered borrow so we can
+        // mutably access preview_cache on the next line
+        let session_key = {
+            let filtered = self.filtered();
+            filtered.get(self.selected).map(|s| (s.session_id.clone(), s.path.clone()))
+        };
+        let Some((session_id, session_path)) = session_key else { return };
 
         // Populate cache on first view of this session
         let messages = self.preview_cache
-            .entry(session.session_id.clone())
-            .or_insert_with(|| load_preview(&session.path));
+            .entry(session_id)
+            .or_insert_with(|| load_preview(&session_path));
 
         let width = inner.width.saturating_sub(1) as usize; // 1-char right margin
         let height = inner.height as usize;
@@ -489,7 +555,7 @@ impl<'a> App<'a> {
     }
 }
 
-pub fn run(sessions: &[&SessionEntry], initial_selected: usize) -> Result<TuiAction, Box<dyn std::error::Error>> {
+pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &std::path::Path) -> Result<TuiAction, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -497,7 +563,7 @@ pub fn run(sessions: &[&SessionEntry], initial_selected: usize) -> Result<TuiAct
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(sessions, initial_selected);
+    let mut app = App::new(sessions, index_path.to_path_buf(), initial_selected);
 
     let action = loop {
         terminal.draw(|f| app.render(f))?;
@@ -560,24 +626,20 @@ pub fn run(sessions: &[&SessionEntry], initial_selected: usize) -> Result<TuiAct
                             };
                         }
                     }
+                    KeyCode::Right => app.show_preview = true,
+                    KeyCode::Left => app.show_preview = false,
                     KeyCode::Char('F') => {
                         app.flagged_only = !app.flagged_only;
                         app.clamp_selected();
                     }
                     KeyCode::Char('q') => break TuiAction::Quit,
                     KeyCode::Char('x') => {
-                        let filtered = app.filtered();
-                        if !filtered.is_empty() {
-                            let session_id = filtered[app.selected].session_id.clone();
-                            break TuiAction::MarkDone { session_id, cursor: app.selected };
-                        }
+                        let id = app.filtered().get(app.selected).map(|s| s.session_id.clone());
+                        if let Some(id) = id { app.handle_mark_done(&id); }
                     }
                     KeyCode::Char('f') => {
-                        let filtered = app.filtered();
-                        if !filtered.is_empty() {
-                            let session_id = filtered[app.selected].session_id.clone();
-                            break TuiAction::Flag { session_id, cursor: app.selected };
-                        }
+                        let id = app.filtered().get(app.selected).map(|s| s.session_id.clone());
+                        if let Some(id) = id { app.handle_flag(&id); }
                     }
                     KeyCode::Char('c')
                         if key.modifiers.contains(KeyModifiers::CONTROL) =>
