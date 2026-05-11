@@ -31,6 +31,40 @@ use serde_json::Value;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn false_positives_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .expect("Could not find home directory")
+        .join(".wip")
+        .join("false_positives.json")
+}
+
+// Appends a session to the false positives log for later prompt analysis.
+fn record_false_positive(session: &SessionEntry) {
+    let path = false_positives_path();
+    let mut entries: Vec<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    entries.push(serde_json::json!({
+        "session_id": session.session_id,
+        "path": session.path,
+        "status": session.status,
+        "summary": session.summary,
+        "left_off": session.left_off,
+        "flagged_at": now,
+    }));
+
+    if let Ok(json) = serde_json::to_string_pretty(&entries) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 fn format_age(ts: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -699,6 +733,11 @@ pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &st
                     KeyCode::Char('f') => {
                         let id = app.filtered().get(app.selected).map(|s| s.session_id.clone());
                         if let Some(id) = id { app.handle_flag(&id); }
+                    }
+                    KeyCode::Char('*') => {
+                        if let Some(session) = app.filtered().get(app.selected) {
+                            record_false_positive(session);
+                        }
                     }
                     KeyCode::Char('c')
                         if key.modifiers.contains(KeyModifiers::CONTROL) =>
