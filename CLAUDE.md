@@ -106,6 +106,7 @@ Claude Code writes one JSON object per line. Known record types:
 - `attachment` — file attachments added to the conversation
 - `progress` — sub-agent progress events
 - `last-prompt` — records the last prompt the user typed; written at session end
+- `custom-title` — written by the `/rename` command; contains `customTitle` (string). Multiple records may appear; the last one wins. `wip` uses this as the display name in the TUI, overriding the project directory name.
 - `pr-link` — written when a PR is created during a session; contains `prNumber`, `prUrl`, `prRepository`
 - `agent-setting` — first record in sessions spawned as named agents (filenames also start with `agent-`)
 - `queue-operation` — first record in sessions spawned automatically by Claude Code for background tasks (e.g. generating thread titles, injecting prior conversation context). These are **not user-initiated**.

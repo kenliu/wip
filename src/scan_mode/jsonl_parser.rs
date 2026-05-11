@@ -20,6 +20,10 @@ pub struct ExtractedContext {
     pub cwd: Option<String>,
     // The last thing the user typed, from the `last-prompt` record written at session end
     pub last_prompt: Option<String>,
+    // User-assigned name from the `/rename` command, stored in `custom-title` records
+    pub custom_title: Option<String>,
+    // Total number of user turns in the session (before tail truncation)
+    pub turn_count: u32,
 }
 
 /// Returns true if this session was started via a queue-operation (an automated
@@ -42,6 +46,7 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
     let mut messages: Vec<(String, String)> = Vec::new();
     let mut cwd: Option<String> = None;
     let mut last_prompt: Option<String> = None;
+    let mut custom_title: Option<String> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -76,6 +81,12 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
                     last_prompt = Some(s.to_string());
                 }
             }
+            // Written by /rename; the last record wins if there are multiple
+            Some("custom-title") => {
+                if let Some(s) = v.get("customTitle").and_then(|s| s.as_str()) {
+                    custom_title = Some(s.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -88,12 +99,14 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
         .map(|(_, c)| c.clone())
         .unwrap_or_default();
 
+    let turn_count = messages.iter().filter(|(role, _)| role == "user").count() as u32;
+
     // Keep only the tail of the conversation — the recent context is what matters
     // for determining status and what was left off
     let recent_start = messages.len().saturating_sub(15);
     let recent_messages = messages[recent_start..].to_vec();
 
-    Ok(ExtractedContext { first_message, recent_messages, cwd, last_prompt })
+    Ok(ExtractedContext { first_message, recent_messages, cwd, last_prompt, custom_title, turn_count })
 }
 
 fn extract_user_content(v: &Value) -> Option<String> {
