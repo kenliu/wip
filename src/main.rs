@@ -11,6 +11,8 @@ mod user_mode;
 #[derive(Parser)]
 #[command(name = "wip")]
 #[command(about = "Find and resume your in-progress LLM sessions")]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_SHA"), ")"))]
+#[command(after_help = concat!("Build: ", env!("CARGO_PKG_VERSION"), " (", env!("GIT_SHA"), ")"))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
