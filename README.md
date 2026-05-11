@@ -87,7 +87,9 @@ Key bindings:
 - `x` — mark session as done
 - `q` / `Esc` — quit
 
-`wip fast` offers a lighter fzf-based picker if you prefer keyboard-only selection:
+## fzf picker (`wip fast`)
+
+`wip fast` is a lightweight fzf-based alternative for keyboard-optimized selection. Requires `fzf` (`brew install fzf`).
 
 ```
 wip > 
