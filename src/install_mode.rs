@@ -10,6 +10,8 @@ use std::process::Command;
 
 use crate::config::{Config, SummaryBackend};
 
+use std::path::Path;
+
 const LABEL: &str = "com.kenliu.wip";
 const INTERVAL_SECS: u32 = 600; // 10 minutes
 
@@ -27,7 +29,34 @@ fn log_path() -> PathBuf {
         .join("launchd.log")
 }
 
-fn generate_plist(wip_bin: &str, env_vars: &HashMap<String, String>, log_file: &str) -> String {
+fn prompt(text: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    print!("{}", text);
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
+/// Finds the directory containing `gcloud` by running `which gcloud`.
+fn detect_gcloud_dir() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("which")
+        .arg("gcloud")
+        .output()
+        .map_err(|_| "could not run 'which gcloud'")?;
+    if !output.status.success() {
+        return Err("gcloud not found on PATH. Install the Google Cloud SDK first.".into());
+    }
+    let gcloud_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let dir = Path::new(&gcloud_path)
+        .parent()
+        .ok_or("could not determine gcloud directory")?
+        .to_string_lossy()
+        .to_string();
+    Ok(dir)
+}
+
+pub(crate) fn generate_plist(wip_bin: &str, env_vars: &HashMap<String, String>, log_file: &str) -> String {
     // Build the EnvironmentVariables block only if there are vars to embed.
     // launchd agents don't inherit the shell environment, so any required env
     // vars must be explicitly set here.
@@ -98,11 +127,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "/usr/local/bin/wip".to_string());
 
-    print!("Path to wip binary [{}]: ", suggested_bin);
-    std::io::Write::flush(&mut std::io::stdout())?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    let input = prompt(&format!("Path to wip binary [{}]: ", suggested_bin))?;
     let wip_bin = input.trim().to_string();
     let wip_bin = if wip_bin.is_empty() { suggested_bin } else { wip_bin };
 
@@ -123,15 +148,19 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
             env_vars.insert("ANTHROPIC_API_KEY".to_string(), api_key);
         }
         SummaryBackend::Vertex => {
-            // Vertex uses Application Default Credentials (ADC). The credential
-            // file lives at a well-known path (~/.config/gcloud/...) so launchd
-            // can find it without an explicit env var. We do forward
-            // GOOGLE_APPLICATION_CREDENTIALS if the user has set it to a
-            // non-default location.
             if let Ok(creds) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
                 env_vars.insert("GOOGLE_APPLICATION_CREDENTIALS".to_string(), creds);
             }
-            println!("Vertex backend detected — using Application Default Credentials (ADC).");
+            // launchd agents get a minimal PATH that won't include gcloud.
+            // Detect gcloud's location and embed just its directory so the
+            // summarizer can shell out to `gcloud auth print-access-token`.
+            // TODO: read ADC tokens directly instead of shelling out to gcloud.
+            let gcloud_dir = detect_gcloud_dir()?;
+            let confirmed_dir = prompt(&format!("Path to gcloud directory [{}]: ", gcloud_dir))?;
+            let confirmed_dir = confirmed_dir.trim();
+            let gcloud_dir = if confirmed_dir.is_empty() { gcloud_dir } else { confirmed_dir.to_string() };
+            env_vars.insert("PATH".to_string(), format!("{gcloud_dir}:/usr/bin:/bin"));
+
             println!("Make sure 'gcloud auth application-default login' has been run on this machine.");
         }
     }
@@ -191,4 +220,43 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     println!("Uninstalled. Removed {}", plist_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_no_env_vars() {
+        let plist = generate_plist("/usr/local/bin/wip", &HashMap::new(), "/tmp/wip.log");
+        assert!(plist.contains("<string>/usr/local/bin/wip</string>"));
+        assert!(plist.contains("<string>scan</string>"));
+        assert!(plist.contains("<string>/tmp/wip.log</string>"));
+        assert!(plist.contains(&format!("<integer>{}</integer>", INTERVAL_SECS)));
+        assert!(!plist.contains("EnvironmentVariables"));
+    }
+
+    #[test]
+    fn plist_with_api_key() {
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), "sk-test-123".to_string());
+        let plist = generate_plist("/usr/local/bin/wip", &env, "/tmp/wip.log");
+        assert!(plist.contains("EnvironmentVariables"));
+        assert!(plist.contains("<key>ANTHROPIC_API_KEY</key>"));
+        assert!(plist.contains("<string>sk-test-123</string>"));
+    }
+
+    #[test]
+    fn plist_is_valid_xml_structure() {
+        let plist = generate_plist("/usr/local/bin/wip", &HashMap::new(), "/tmp/wip.log");
+        assert!(plist.starts_with("<?xml"));
+        assert!(plist.contains("<plist version=\"1.0\">"));
+        assert!(plist.trim_end().ends_with("</plist>"));
+    }
+
+    #[test]
+    fn plist_contains_label() {
+        let plist = generate_plist("/usr/local/bin/wip", &HashMap::new(), "/tmp/wip.log");
+        assert!(plist.contains(&format!("<string>{}</string>", LABEL)));
+    }
 }
