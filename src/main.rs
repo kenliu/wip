@@ -14,6 +14,9 @@ mod user_mode;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Run a scan in the background while the TUI is open
+    #[arg(long)]
+    background_scan: bool,
 }
 
 #[derive(Subcommand)]
@@ -50,9 +53,9 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        None => user_mode::run().await,
+        None => user_mode::run(cli.background_scan).await,
         Some(Command::Fast) => fast_mode::run().await,
-        Some(Command::Scan { force }) => scan_mode::run(force).await,
+        Some(Command::Scan { force }) => scan_mode::run(force, false).await,
         Some(Command::Install) => install_mode::install(),
         Some(Command::Uninstall) => install_mode::uninstall(),
         Some(Command::Index {

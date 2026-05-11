@@ -1,4 +1,13 @@
 use crate::index::SessionEntry;
+use std::collections::HashMap;
+
+pub enum TuiAction {
+    Resume { session_id: String, cwd: Option<String> },
+    MarkDone { session_id: String, cursor: usize },
+    Flag { session_id: String, cursor: usize },
+    Quit,
+}
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -6,13 +15,14 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Paragraph},
     Terminal,
 };
-use std::io::{self, Write};
+use serde_json::Value;
+use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn format_age(ts: i64) -> String {
@@ -30,6 +40,16 @@ fn format_age(ts: i64) -> String {
     }
 }
 
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1}M", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{}K", bytes / 1_024)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 fn project_name(cwd: &str) -> String {
     std::path::Path::new(cwd)
         .file_name()
@@ -37,53 +57,157 @@ fn project_name(cwd: &str) -> String {
         .unwrap_or_default()
 }
 
+// Returns the user-assigned title if set, otherwise the project directory name.
+fn session_display_name(session: &SessionEntry) -> String {
+    session.custom_title.clone()
+        .unwrap_or_else(|| project_name(session.cwd.as_deref().unwrap_or("")))
+}
+
+// ── Chat preview helpers ──────────────────────────────────────────────────────
+
+fn load_preview(path: &str) -> Vec<(String, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else { return vec![] };
+    let mut messages = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") => {
+                if let Some(text) = extract_preview_user(&v) {
+                    messages.push(("user".to_string(), text));
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = extract_preview_assistant(&v) {
+                    messages.push(("assistant".to_string(), text));
+                }
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+fn extract_preview_user(v: &Value) -> Option<String> {
+    let content = v.get("message")?.get("content")?;
+    match content {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() { return None; }
+            // Skip meta/system injections (local-command-caveat, system-reminder, etc.)
+            if s.starts_with('<') { return None; }
+            Some(s.to_string())
+        }
+        Value::Array(arr) => {
+            let text: String = arr.iter()
+                .filter_map(|item| {
+                    if item.get("type")?.as_str()? == "text" {
+                        let t = item.get("text")?.as_str()?.trim();
+                        if t.is_empty() || t.starts_with('<') { return None; }
+                        Some(t.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
+    }
+}
+
+fn extract_preview_assistant(v: &Value) -> Option<String> {
+    // Assistant content is an array; only text blocks are human-readable.
+    // Thinking and tool_use blocks are skipped — too verbose for a preview.
+    let arr = v.get("message")?.get("content")?.as_array()?;
+    let text: String = arr.iter()
+        .filter_map(|item| {
+            if item.get("type")?.as_str()? == "text" {
+                let t = item.get("text")?.as_str()?.trim();
+                if t.is_empty() { return None; }
+                Some(t.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() { None } else { Some(text) }
+}
+
+// Greedy word-wrap: splits `text` into lines of at most `width` chars.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 { return vec![]; }
+    let mut result = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.trim().is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if line.is_empty() {
+                line = word.to_string();
+            } else if line.len() + 1 + word.len() <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                result.push(line);
+                line = word.to_string();
+            }
+        }
+        if !line.is_empty() {
+            result.push(line);
+        }
+    }
+    result
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
 struct App<'a> {
     sessions: &'a [&'a SessionEntry],
     selected: usize,
     filter: String,
     // When true, keyboard input goes to the filter string instead of navigation
     filter_mode: bool,
+    // When true, only flagged sessions are shown
+    flagged_only: bool,
+    // Keyed by session_id; populated lazily on first render of each session
+    preview_cache: HashMap<String, Vec<(String, String)>>,
 }
 
 impl<'a> App<'a> {
-    fn new(sessions: &'a [&'a SessionEntry]) -> Self {
+    fn new(sessions: &'a [&'a SessionEntry], initial_selected: usize) -> Self {
+        let selected = initial_selected.min(sessions.len().saturating_sub(1));
         Self {
             sessions,
-            selected: 0,
+            selected,
             filter: String::new(),
             filter_mode: false,
+            flagged_only: false,
+            preview_cache: HashMap::new(),
         }
     }
 
-    // Returns sessions matching the current filter (all sessions when filter is empty).
-    // Matches against the project name (last path component of cwd).
+    // Returns sessions matching the current filter and flagged_only mode.
     fn filtered(&self) -> Vec<&'a SessionEntry> {
-        if self.filter.is_empty() {
-            return self.sessions.iter().copied().collect();
-        }
         let q = self.filter.to_lowercase();
         self.sessions
             .iter()
             .copied()
             .filter(|s| {
-                let p = project_name(s.cwd.as_deref().unwrap_or(""));
-                p.to_lowercase().contains(&q)
+                if self.flagged_only && !s.flagged { return false; }
+                if !q.is_empty() && !session_display_name(s).to_lowercase().contains(&q) { return false; }
+                true
             })
             .collect()
     }
 
     fn filtered_count(&self) -> usize {
-        if self.filter.is_empty() {
-            return self.sessions.len();
-        }
-        let q = self.filter.to_lowercase();
-        self.sessions
-            .iter()
-            .filter(|s| {
-                let p = project_name(s.cwd.as_deref().unwrap_or(""));
-                p.to_lowercase().contains(&q)
-            })
-            .count()
+        self.filtered().len()
     }
 
     fn move_up(&mut self) {
@@ -115,34 +239,63 @@ impl<'a> App<'a> {
         self.selected.saturating_sub(per_page.saturating_sub(1))
     }
 
-    fn render(&self, frame: &mut ratatui::Frame) {
-        let filtered = self.filtered();
+    fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
 
-        let [header_area, list_area, footer_area] = Layout::vertical([
-            Constraint::Length(2),
+        // Header and footer span the full width; panes share the middle
+        let [header_area, content_area, footer_area] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
-        ])
-        .areas(area);
+        ]).areas(area);
 
-        // ── Header ──────────────────────────────────────────────────────────
-        let header_text = if self.filter.is_empty() {
-            "  IN-PROGRESS SESSIONS".to_string()
+        self.render_header(frame, header_area);
+
+        if content_area.width >= 120 {
+            let [left_area, right_area] = Layout::horizontal([
+                Constraint::Percentage(55),
+                Constraint::Percentage(45),
+            ]).areas(content_area);
+            self.render_session_list(frame, left_area);
+            self.render_preview(frame, right_area);
+        } else {
+            self.render_session_list(frame, content_area);
+        }
+
+        self.render_footer(frame, footer_area);
+    }
+
+    fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let filtered = self.filtered();
+        let count = filtered.len();
+        let position = if count == 0 { 0 } else { self.selected + 1 };
+        let header_text = if self.flagged_only {
+            format!("  WIP: 🚩 FLAGGED  ({}/{})", position, count)
+        } else if self.filter.is_empty() {
+            format!("  WIP: IN-PROGRESS SESSIONS  ({}/{})", position, count)
         } else {
             format!(
-                "  IN-PROGRESS SESSIONS  ({} of {})",
-                filtered.len(),
+                "  WIP: IN-PROGRESS SESSIONS  ({}/{} of {})",
+                position,
+                count,
                 self.sessions.len()
             )
         };
+
+        let bg = Color::Rgb(40, 44, 52);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 header_text,
-                Style::default().add_modifier(Modifier::BOLD),
-            ))),
-            header_area,
+                Style::default().fg(Color::Cyan).bg(bg).add_modifier(Modifier::BOLD),
+            )))
+            .style(Style::default().bg(bg)),
+            area,
         );
+    }
+
+    fn render_session_list(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let filtered = self.filtered();
+        let list_area = area;
 
         // ── Session list ─────────────────────────────────────────────────────
         let list_height = list_area.height;
@@ -175,19 +328,22 @@ impl<'a> App<'a> {
                 };
 
                 let cursor = if is_selected { "▶" } else { " " };
-                let project = project_name(session.cwd.as_deref().unwrap_or(""));
+                let display_name = session_display_name(session);
                 let age = format_age(session.file_modified_at);
+                let size = format_size(session.file_size_bytes);
 
-                // Row 1: cursor + project + provider + age
+                // Row 1: cursor + display name + age + file size + turn count
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{} {:<22}", cursor, project), row_style),
-                    Span::styled(format!("{:<14}", session.provider), dim_style),
-                    Span::styled(format!("{:>8}", age), dim_style),
+                    Span::styled(format!("{} {:<21}", cursor, display_name), row_style),
+                    Span::styled(format!("{:<10}", age), dim_style),
+                    Span::styled(format!("{:<7}", size), dim_style),
+                    Span::styled(format!("{}t", session.turn_count), dim_style),
                 ]));
 
-                // Row 2: topic summary — what this session is about
+                // Row 2: flag (only if set) + topic summary
                 if lines.len() < list_height as usize {
-                    let text = format!("  {}", session.summary);
+                    let flag_prefix = if session.flagged { "🚩 " } else { "" };
+                    let text = format!("  {}{}", flag_prefix, session.summary);
                     let truncated: String =
                         text.chars().take(max_width.saturating_sub(2)).collect();
                     lines.push(Line::from(Span::styled(truncated, row_style)));
@@ -222,57 +378,118 @@ impl<'a> App<'a> {
         }
 
         frame.render_widget(Paragraph::new(lines), list_area);
+    }
 
-        // ── Footer ───────────────────────────────────────────────────────────
-        let bold = Style::default().add_modifier(Modifier::BOLD).fg(Color::DarkGray);
-        let dim = Style::default().fg(Color::DarkGray);
+    fn render_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
+        // Dark blue-gray bar — complements the cyan selection highlight
+        let bg = Color::Rgb(40, 44, 52);
+        let footer_base = Style::default().fg(Color::Gray).bg(bg);
+        let key_style = Style::default().fg(Color::Cyan).bg(bg).add_modifier(Modifier::BOLD);
+        let label_style = Style::default().fg(Color::Rgb(100, 110, 120)).bg(bg);
 
         if self.filter_mode {
-            // Show filter input with a block cursor indicator
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("  / {}▌", self.filter),
-                    Style::default().fg(Color::Yellow),
-                ))),
-                footer_area,
+                    footer_base,
+                )))
+                .style(footer_base),
+                area,
             );
         } else if !self.filter.is_empty() {
-            // Filter is active but not being edited — show edit/clear hints
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("↑↓", bold),
-                    Span::styled(" navigate   ", dim),
-                    Span::styled("enter", bold),
-                    Span::styled(" resume   ", dim),
-                    Span::styled("/", bold),
-                    Span::styled(" edit filter   ", dim),
-                    Span::styled("esc", bold),
-                    Span::styled(" clear", dim),
-                ])),
-                footer_area,
+                    Span::styled("↑↓", key_style),
+                    Span::styled(" navigate   ", label_style),
+                    Span::styled("enter", key_style),
+                    Span::styled(" resume   ", label_style),
+                    Span::styled("/", key_style),
+                    Span::styled(" edit filter   ", label_style),
+                    Span::styled("esc", key_style),
+                    Span::styled(" clear", label_style),
+                ]))
+                .style(footer_base),
+                area,
             );
         } else {
-            // Normal mode — no active filter
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("↑↓", bold),
-                    Span::styled(" navigate   ", dim),
-                    Span::styled("enter", bold),
-                    Span::styled(" resume   ", dim),
-                    Span::styled("/", bold),
-                    Span::styled(" filter   ", dim),
-                    Span::styled("q", bold),
-                    Span::styled(" quit", dim),
-                ])),
-                footer_area,
+                    Span::styled("↑↓", key_style),
+                    Span::styled(" navigate   ", label_style),
+                    Span::styled("enter", key_style),
+                    Span::styled(" resume   ", label_style),
+                    Span::styled("/", key_style),
+                    Span::styled(" filter   ", label_style),
+                    Span::styled("x", key_style),
+                    Span::styled(" mark done   ", label_style),
+                    Span::styled("f", key_style),
+                    Span::styled(" flag   ", label_style),
+                    Span::styled("F", key_style),
+                    Span::styled(" flagged only   ", label_style),
+                    Span::styled("q", key_style),
+                    Span::styled(" quit", label_style),
+                ]))
+                .style(footer_base),
+                area,
             );
         }
     }
+
+    fn render_preview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        // Left border acts as a visual divider between the two panes
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let filtered = self.filtered();
+        let Some(session) = filtered.get(self.selected).copied() else { return };
+
+        // Populate cache on first view of this session
+        let messages = self.preview_cache
+            .entry(session.session_id.clone())
+            .or_insert_with(|| load_preview(&session.path));
+
+        let width = inner.width.saturating_sub(1) as usize; // 1-char right margin
+        let height = inner.height as usize;
+
+        // Build rendered lines for all messages
+        let mut all_lines: Vec<Line> = Vec::new();
+        for (role, content) in messages.iter() {
+            let is_user = role == "user";
+            if is_user {
+                // User turns: ❯ prefix on the first line, continuation lines indented to match
+                for (i, wrapped) in wrap_text(content, width.saturating_sub(2)).iter().enumerate() {
+                    let prefix = if i == 0 { "❯ " } else { "  " };
+                    all_lines.push(Line::from(Span::styled(
+                        format!("{}{}", prefix, wrapped),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )));
+                }
+            } else {
+                // Assistant turns: plain gray text, no label
+                for wrapped in wrap_text(content, width.saturating_sub(1)) {
+                    all_lines.push(Line::from(Span::styled(
+                        format!(" {}", wrapped),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            all_lines.push(Line::default());
+        }
+
+        // Show only the tail so the most recent message is always visible
+        let start = all_lines.len().saturating_sub(height);
+        let visible: Vec<Line> = all_lines[start..].to_vec();
+
+        frame.render_widget(Paragraph::new(visible), inner);
+    }
 }
 
-pub fn run(sessions: &[&SessionEntry]) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(sessions: &[&SessionEntry], initial_selected: usize) -> Result<TuiAction, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -280,9 +497,9 @@ pub fn run(sessions: &[&SessionEntry]) -> Result<(), Box<dyn std::error::Error>>
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(sessions);
+    let mut app = App::new(sessions, initial_selected);
 
-    let chosen = loop {
+    let action = loop {
         terminal.draw(|f| app.render(f))?;
 
         if let Event::Key(key) = event::read()? {
@@ -299,7 +516,11 @@ pub fn run(sessions: &[&SessionEntry]) -> Result<(), Box<dyn std::error::Error>>
                         app.filter_mode = false;
                         let filtered = app.filtered();
                         if !filtered.is_empty() {
-                            break Some(filtered[app.selected]);
+                            let s = filtered[app.selected];
+                            break TuiAction::Resume {
+                                session_id: s.session_id.clone(),
+                                cwd: s.cwd.clone(),
+                            };
                         }
                     }
                     KeyCode::Backspace => {
@@ -326,20 +547,42 @@ pub fn run(sessions: &[&SessionEntry]) -> Result<(), Box<dyn std::error::Error>>
                             app.filter.clear();
                             app.clamp_selected();
                         } else {
-                            break None;
+                            break TuiAction::Quit;
                         }
                     }
                     KeyCode::Enter => {
                         let filtered = app.filtered();
                         if !filtered.is_empty() {
-                            break Some(filtered[app.selected]);
+                            let s = filtered[app.selected];
+                            break TuiAction::Resume {
+                                session_id: s.session_id.clone(),
+                                cwd: s.cwd.clone(),
+                            };
                         }
                     }
-                    KeyCode::Char('q') => break None,
+                    KeyCode::Char('F') => {
+                        app.flagged_only = !app.flagged_only;
+                        app.clamp_selected();
+                    }
+                    KeyCode::Char('q') => break TuiAction::Quit,
+                    KeyCode::Char('x') => {
+                        let filtered = app.filtered();
+                        if !filtered.is_empty() {
+                            let session_id = filtered[app.selected].session_id.clone();
+                            break TuiAction::MarkDone { session_id, cursor: app.selected };
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        let filtered = app.filtered();
+                        if !filtered.is_empty() {
+                            let session_id = filtered[app.selected].session_id.clone();
+                            break TuiAction::Flag { session_id, cursor: app.selected };
+                        }
+                    }
                     KeyCode::Char('c')
                         if key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        break None
+                        break TuiAction::Quit;
                     }
                     _ => {}
                 }
@@ -347,26 +590,9 @@ pub fn run(sessions: &[&SessionEntry]) -> Result<(), Box<dyn std::error::Error>>
         }
     };
 
-    // Restore terminal before exec'ing claude or returning
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Some(session) = chosen {
-        print!("\x1B[2J\x1B[1;1H");
-        io::stdout().flush()?;
-
-        // exec() replaces this process entirely — no wip process remains in the process table
-        use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new("claude");
-        cmd.arg("--resume").arg(&session.session_id);
-        if let Some(cwd) = &session.cwd {
-            if !cwd.is_empty() {
-                cmd.current_dir(cwd);
-            }
-        }
-        return Err(format!("Failed to launch claude: {}", cmd.exec()).into());
-    }
-
-    Ok(())
+    Ok(action)
 }
