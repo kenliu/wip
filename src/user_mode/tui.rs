@@ -1,5 +1,13 @@
 use crate::index::{acquire_lock, Index, SessionEntry};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UiState {
+    pub show_preview: bool,
+    pub show_all: bool,
+    pub flagged_only: bool,
+}
 
 pub enum TuiAction {
     Resume { session_id: String, cwd: Option<String> },
@@ -185,6 +193,8 @@ struct App {
     filter_mode: bool,
     // When true, only flagged sessions are shown
     flagged_only: bool,
+    // When true, done sessions are included in the list
+    show_all: bool,
     // When true, the chat preview pane is shown (toggled with →/←)
     show_preview: bool,
     // Keyed by session_id; populated lazily on first render of each session
@@ -192,7 +202,7 @@ struct App {
 }
 
 impl App {
-    fn new(sessions: Vec<SessionEntry>, index_path: std::path::PathBuf, initial_selected: usize) -> Self {
+    fn new(sessions: Vec<SessionEntry>, index_path: std::path::PathBuf, initial_selected: usize, ui_state: UiState) -> Self {
         let selected = initial_selected.min(sessions.len().saturating_sub(1));
         Self {
             sessions,
@@ -200,18 +210,24 @@ impl App {
             selected,
             filter: String::new(),
             filter_mode: false,
-            flagged_only: false,
-            show_preview: false,
+            flagged_only: ui_state.flagged_only,
+            show_all: ui_state.show_all,
+            show_preview: ui_state.show_preview,
             preview_cache: HashMap::new(),
         }
     }
 
-    // Returns sessions matching the current filter and flagged_only mode.
+    fn is_done(s: &SessionEntry) -> bool {
+        s.status == "done" || s.manually_done
+    }
+
+    // Returns sessions matching the current filter and flagged_only/show_all modes.
     fn filtered(&self) -> Vec<&SessionEntry> {
         let q = self.filter.to_lowercase();
         self.sessions
             .iter()
             .filter(|s| {
+                if !self.show_all && Self::is_done(s) { return false; }
                 if self.flagged_only && !s.flagged { return false; }
                 if !q.is_empty() {
                     let proj = project_name(s.cwd.as_deref().unwrap_or(""));
@@ -314,6 +330,10 @@ impl App {
         let position = if count == 0 { 0 } else { self.selected + 1 };
         let header_text = if self.flagged_only {
             format!("  WIP: 🚩 FLAGGED  ({}/{})", position, count)
+        } else if self.show_all && self.filter.is_empty() {
+            format!("  WIP: ALL SESSIONS  ({}/{})", position, count)
+        } else if self.show_all {
+            format!("  WIP: ALL SESSIONS  ({}/{} of {})", position, count, self.sessions.len())
         } else if self.filter.is_empty() {
             format!("  WIP: IN-PROGRESS SESSIONS  ({}/{})", position, count)
         } else {
@@ -359,12 +379,16 @@ impl App {
                 }
 
                 let is_selected = i == self.selected;
+                let is_done = Self::is_done(session);
                 let (row_style, dim_style) = if is_selected {
                     (
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         Style::default().fg(Color::Cyan),
+                    )
+                } else if is_done {
+                    (
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
                     )
                 } else {
                     (Style::default(), Style::default().fg(Color::DarkGray))
@@ -375,9 +399,16 @@ impl App {
                 let age = format_age(session.file_modified_at);
                 let size = format_size(session.file_size_bytes);
 
-                // Row 1: cursor + project name + age + file size + turn count
+                // Row 1: cursor + project name (strikethrough if done) + age + size + turns
+                let proj_style = if is_done {
+                    row_style.add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    row_style
+                };
+                let done_prefix = if is_done { "✓ " } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{} {:<21}", cursor, proj), row_style),
+                    Span::styled(format!("{} {}", cursor, done_prefix), row_style),
+                    Span::styled(format!("{:<21}", proj), proj_style),
                     Span::styled(format!("{:<10}", age), dim_style),
                     Span::styled(format!("{:<7}", size), dim_style),
                     Span::styled(format!("{}t", session.turn_count), dim_style),
@@ -390,7 +421,11 @@ impl App {
 
                     if let Some(title) = &session.custom_title {
                         let badge = format!(" {} ", title);
-                        let badge_style = row_style.add_modifier(Modifier::REVERSED);
+                        let badge_style = if is_done {
+                            row_style.add_modifier(Modifier::REVERSED).add_modifier(Modifier::CROSSED_OUT)
+                        } else {
+                            row_style.add_modifier(Modifier::REVERSED)
+                        };
                         let used = indent.chars().count() + badge.chars().count() + 1;
                         let summary: String = session.summary.chars()
                             .take(max_width.saturating_sub(used))
@@ -479,12 +514,16 @@ impl App {
                     Span::styled(" navigate   ", label_style),
                     Span::styled("enter", key_style),
                     Span::styled(" resume   ", label_style),
+                    Span::styled("o", key_style),
+                    Span::styled(" open in tab   ", label_style),
                     Span::styled("/", key_style),
                     Span::styled(" filter   ", label_style),
                     Span::styled("x", key_style),
                     Span::styled(" mark done   ", label_style),
                     Span::styled("f", key_style),
                     Span::styled(" flag   ", label_style),
+                    Span::styled("a", key_style),
+                    Span::styled(" all   ", label_style),
                     Span::styled("F", key_style),
                     Span::styled(" flagged only   ", label_style),
                     Span::styled("→/←", key_style),
@@ -555,7 +594,7 @@ impl App {
     }
 }
 
-pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &std::path::Path) -> Result<TuiAction, Box<dyn std::error::Error>> {
+pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &std::path::Path, ui_state: UiState) -> Result<(TuiAction, UiState), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -563,7 +602,7 @@ pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &st
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(sessions, index_path.to_path_buf(), initial_selected);
+    let mut app = App::new(sessions, index_path.to_path_buf(), initial_selected, ui_state);
 
     let action = loop {
         terminal.draw(|f| app.render(f))?;
@@ -626,8 +665,28 @@ pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &st
                             };
                         }
                     }
+                    KeyCode::Char('o') => {
+                        let filtered = app.filtered();
+                        if !filtered.is_empty() {
+                            let s = filtered[app.selected];
+                            let mut cmd = std::process::Command::new("wezterm");
+                            cmd.args(["cli", "spawn"]);
+                            if let Some(ref dir) = s.cwd {
+                                if !dir.is_empty() {
+                                    cmd.args(["--cwd", dir]);
+                                }
+                            }
+                            cmd.args(["--", "claude", "--resume", &s.session_id]);
+                            cmd.stdout(std::process::Stdio::null());
+                            let _ = cmd.spawn();
+                        }
+                    }
                     KeyCode::Right => app.show_preview = true,
                     KeyCode::Left => app.show_preview = false,
+                    KeyCode::Char('a') => {
+                        app.show_all = !app.show_all;
+                        app.clamp_selected();
+                    }
                     KeyCode::Char('F') => {
                         app.flagged_only = !app.flagged_only;
                         app.clamp_selected();
@@ -656,5 +715,10 @@ pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &st
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    Ok(action)
+    let ui_state = UiState {
+        show_preview: app.show_preview,
+        show_all: app.show_all,
+        flagged_only: app.flagged_only,
+    };
+    Ok((action, ui_state))
 }

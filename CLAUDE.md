@@ -58,6 +58,15 @@ Expected result: ~200-400 tokens per new/modified session, ~0 for cached ones.
 - API keys stored in system keychain (via `keyring` crate), never in config
 - Provider CLIs (claude, opencode) are just command templates—no API keys needed for them
 
+### UI State Persistence
+
+Toggle state is persisted across sessions in `~/.wip/ui_state.json`:
+- `show_preview` — right-pane chat preview (toggled with `→`/`←`)
+- `show_all` — include done sessions in the list (toggled with `a`)
+- `flagged_only` — show only flagged sessions (toggled with `F`)
+
+State is saved when the TUI exits (any action: resume, open-in-tab, or quit).
+
 ### Index Storage
 
 Single JSON file at `~/.wip/index.json`:

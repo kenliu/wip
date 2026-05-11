@@ -109,6 +109,12 @@ impl Index {
         }
     }
 
+    pub fn all_sessions(&self) -> Vec<&SessionEntry> {
+        let mut sessions: Vec<&SessionEntry> = self.sessions.iter().collect();
+        sessions.sort_by(|a, b| b.file_modified_at.cmp(&a.file_modified_at));
+        sessions
+    }
+
     pub fn in_progress_sessions(&self) -> Vec<&SessionEntry> {
         let mut sessions: Vec<&SessionEntry> = self.sessions
             .iter()
