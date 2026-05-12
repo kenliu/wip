@@ -4,6 +4,7 @@ mod config;
 mod fast_mode;
 mod index;
 mod install_mode;
+mod keychain;
 mod scan_mode;
 mod stats_mode;
 mod user_mode;
@@ -31,6 +32,8 @@ enum Command {
     },
     /// fzf-powered session picker (requires fzf)
     Fast,
+    /// Store an Anthropic API key in the system keychain
+    Auth,
     /// Install launchd agent for automatic background scanning (macOS)
     Install,
     /// Uninstall the launchd agent
@@ -59,6 +62,7 @@ async fn main() {
         None => user_mode::run(cli.background_scan).await,
         Some(Command::Fast) => fast_mode::run().await,
         Some(Command::Scan { force }) => scan_mode::run(force, false).await,
+        Some(Command::Auth) => scan_mode::run_auth().await,
         Some(Command::Install) => install_mode::install(),
         Some(Command::Uninstall) => install_mode::uninstall(),
         Some(Command::Index {

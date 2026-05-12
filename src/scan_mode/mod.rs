@@ -5,7 +5,7 @@
 pub mod jsonl_parser;
 pub mod lm_summarizer;
 
-use crate::config::{config_path, Config, ScanConfig, SummaryBackend};
+use crate::config::{config_path, Config, KeychainEntry, ScanConfig, SummaryBackend};
 use crate::index::{acquire_lock, index_path, Index, SessionEntry, SessionStatus};
 use lm_summarizer::SummarizerConfig;
 use std::io::Write;
@@ -55,8 +55,44 @@ fn append_log(msg: &str) {
 const MAX_AGE_DAYS: i64 = 30;
 const MIN_AGE_SECS: i64 = 30;
 
+/// Prompts for an Anthropic API key and stores it in the system keychain,
+/// creating or updating ~/.wip/config.json to point at the keychain entry.
+pub async fn run_auth() -> Result<(), Box<dyn std::error::Error>> {
+    let key_input = prompt("Anthropic API key (sk-ant-...): ")?;
+    let api_key = key_input.trim().to_string();
+    if api_key.is_empty() {
+        return Err("API key is required.".into());
+    }
+
+    crate::keychain::set_password("anthropic_api_key", &api_key).await
+        .map_err(|e| format!("Failed to store key in system keychain: {}", e))?;
+    eprintln!("Stored in system keychain.");
+
+    let path = config_path();
+    let mut config = if path.exists() {
+        Config::load().map_err(|e| format!("Failed to load {}: {}", path.display(), e))?
+    } else {
+        Config {
+            scan: ScanConfig {
+                summary_backend: SummaryBackend::Anthropic,
+                summary_model: "claude-sonnet-4-6".to_string(),
+                ..Default::default()
+            },
+            providers: std::collections::HashMap::new(),
+            storage_dir: "~/.wip".to_string(),
+            index_refresh_threshold: 3600,
+        }
+    };
+
+    config.scan.summary_api_key = Some(KeychainEntry { keychain_key: "anthropic_api_key".to_string() });
+    config.save(&path)?;
+    eprintln!("Updated {}.", path.display());
+
+    Ok(())
+}
+
 pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let summarizer_config = build_summarizer_config()?;
+    let summarizer_config = build_summarizer_config().await?;
 
     let _lock = acquire_lock()?;
     let path = index_path();
@@ -203,13 +239,13 @@ pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Er
 
 /// Builds the summarizer config, running an interactive setup wizard to create
 /// ~/.wip/config.json if it doesn't exist and stdin is a terminal.
-fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Error>> {
+async fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Error>> {
     let path = config_path();
 
     if !path.exists() {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
-            run_setup_wizard(&path)?;
+            run_setup_wizard(&path).await?;
         } else {
             // Non-interactive (cron, pipe): fall back to env var or show setup guide
             return match std::env::var("ANTHROPIC_API_KEY") {
@@ -239,22 +275,33 @@ fn build_summarizer_config() -> Result<SummarizerConfig, Box<dyn std::error::Err
             Ok(SummarizerConfig::Vertex { project_id, region, model })
         }
         SummaryBackend::Anthropic => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                "wip: ANTHROPIC_API_KEY is not set.\n\n\
-                 Add it to your shell profile and re-run:\n\
-                 \n  export ANTHROPIC_API_KEY=sk-ant-..."
-            })?;
+            // Try the keychain first (if configured), then fall back to env var
+            let api_key = resolve_anthropic_api_key(config.scan.summary_api_key.as_ref()).await;
             if api_key.is_empty() {
-                return Err("wip: ANTHROPIC_API_KEY is set but empty. Set it to a valid API key.".into());
+                return Err("wip: Anthropic API key not found.\n\n\
+                            Run `wip scan` in a terminal to configure it, or set:\n\
+                            \n  export ANTHROPIC_API_KEY=sk-ant-...".into());
             }
             Ok(SummarizerConfig::Anthropic { api_key, model })
         }
     }
 }
 
+/// Returns the API key from the keychain entry if configured, falling back to the env var.
+async fn resolve_anthropic_api_key(entry: Option<&KeychainEntry>) -> String {
+    if let Some(e) = entry {
+        match crate::keychain::get_password(&e.keychain_key).await {
+            Ok(key) if !key.is_empty() => return key,
+            Ok(_) => eprintln!("wip: keychain entry '{}' is empty, falling back to env var", e.keychain_key),
+            Err(err) => eprintln!("wip: keychain lookup failed ({}), falling back to env var", err),
+        }
+    }
+    std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()
+}
+
 /// Prompts the user for configuration, writes ~/.wip/config.json, and prints
 /// next-step instructions. Returns an error only if the wizard itself fails.
-fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("wip is not configured. Let's set up your Claude API connection.\n");
     eprintln!("Which backend would you like to use?");
     eprintln!("  1) Anthropic API key");
@@ -285,9 +332,36 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
             ..Default::default()
         }
     } else {
+        let key_input = prompt("Anthropic API key (sk-ant-...): ")?;
+        let api_key = key_input.trim().to_string();
+        if api_key.is_empty() {
+            return Err("API key is required for the Anthropic backend.".into());
+        }
+
+        let store_input = prompt("Store in system keychain? [Y/n]: ")?;
+        let store_in_keychain = !matches!(store_input.trim().to_lowercase().as_str(), "n" | "no");
+
+        let summary_api_key = if store_in_keychain {
+            match crate::keychain::set_password("anthropic_api_key", &api_key).await {
+                Ok(()) => {
+                    eprintln!("Stored in system keychain.");
+                    Some(KeychainEntry { keychain_key: "anthropic_api_key".to_string() })
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not store in keychain: {}.", e);
+                    eprintln!("Set ANTHROPIC_API_KEY in your shell profile instead.");
+                    None
+                }
+            }
+        } else {
+            eprintln!("Set ANTHROPIC_API_KEY in your shell profile to authenticate.");
+            None
+        };
+
         ScanConfig {
             summary_backend: SummaryBackend::Anthropic,
             summary_model: "claude-sonnet-4-6".to_string(),
+            summary_api_key,
             ..Default::default()
         }
     };
@@ -301,9 +375,6 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
         eprintln!("Using model: claude-sonnet-4-6 (edit summary_model in config to change)");
         eprintln!("If you haven't already, authenticate with GCP:");
         eprintln!("  gcloud auth application-default login");
-    } else {
-        eprintln!("Set your Anthropic API key, then run `wip scan`:");
-        eprintln!("  export ANTHROPIC_API_KEY=sk-ant-...");
     }
     eprintln!();
 
