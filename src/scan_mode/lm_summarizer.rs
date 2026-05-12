@@ -6,13 +6,12 @@
 // than requiring the lines to appear in order, since the LLM occasionally adds
 // preamble text before the structured output.
 
+use crate::index::SessionStatus;
 use crate::scan_mode::jsonl_parser::{build_context, ExtractedContext};
 use serde::{Deserialize, Serialize};
 
-// input_tokens and output_tokens are tracked for cost reporting in scan.log.jsonl
-#[allow(dead_code)]
 pub struct SummaryResponse {
-    pub status: String,
+    pub status: SessionStatus,
     pub summary: String,
     pub left_off: String,
     pub input_tokens: u32,
@@ -250,20 +249,20 @@ async fn parse_api_response(
     })
 }
 
-fn parse_response(text: &str) -> Result<(String, String, String), Box<dyn std::error::Error>> {
-    let mut status = String::new();
+pub(crate) fn parse_response(text: &str) -> Result<(SessionStatus, String, String), Box<dyn std::error::Error>> {
+    let mut status: Option<SessionStatus> = None;
     let mut summary = String::new();
     let mut left_off = String::new();
 
     for line in text.lines() {
         let line = line.trim();
-        if status.is_empty() {
+        if status.is_none() {
             if let Some(v) = line.strip_prefix("status:") {
-                let v = v.trim();
-                // Only accept the two valid values; rejects partial or malformed responses
-                if v == "in-progress" || v == "done" {
-                    status = v.to_string();
-                }
+                status = match v.trim() {
+                    "in-progress" => Some(SessionStatus::InProgress),
+                    "done" => Some(SessionStatus::Done),
+                    _ => None,
+                };
             }
         }
         if summary.is_empty() {
@@ -278,8 +277,88 @@ fn parse_response(text: &str) -> Result<(String, String, String), Box<dyn std::e
         }
     }
 
-    if status.is_empty() || summary.is_empty() || left_off.is_empty() {
+    let status = status.ok_or_else(|| {
+        format!("Could not parse response: {}", &text[..text.len().min(200)])
+    })?;
+    if summary.is_empty() || left_off.is_empty() {
         return Err(format!("Could not parse response: {}", &text[..text.len().min(200)]).into());
     }
     Ok((status, summary, left_off))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_in_progress() {
+        let text = "status: in-progress\nsummary: fixing auth bug in login flow\nleft_off: waiting for test results";
+        let (status, summary, left_off) = parse_response(text).unwrap();
+        assert_eq!(status, SessionStatus::InProgress);
+        assert_eq!(summary, "fixing auth bug in login flow");
+        assert_eq!(left_off, "waiting for test results");
+    }
+
+    #[test]
+    fn parse_done() {
+        let text = "status: done\nsummary: refactored config module\nleft_off: Complete.";
+        let (status, summary, left_off) = parse_response(text).unwrap();
+        assert_eq!(status, SessionStatus::Done);
+        assert_eq!(summary, "refactored config module");
+        assert_eq!(left_off, "Complete.");
+    }
+
+    #[test]
+    fn parse_with_preamble() {
+        let text = "Here is my analysis:\nstatus: in-progress\nsummary: adding dark mode\nleft_off: CSS variables not yet applied";
+        let (status, _, _) = parse_response(text).unwrap();
+        assert_eq!(status, SessionStatus::InProgress);
+    }
+
+    #[test]
+    fn parse_out_of_order() {
+        let text = "summary: the summary\nleft_off: the left off\nstatus: done";
+        let (status, summary, left_off) = parse_response(text).unwrap();
+        assert_eq!(status, SessionStatus::Done);
+        assert_eq!(summary, "the summary");
+        assert_eq!(left_off, "the left off");
+    }
+
+    #[test]
+    fn parse_missing_status_errors() {
+        let text = "summary: something\nleft_off: something else";
+        assert!(parse_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_missing_summary_errors() {
+        let text = "status: done\nleft_off: Complete.";
+        assert!(parse_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_missing_left_off_errors() {
+        let text = "status: done\nsummary: the summary";
+        assert!(parse_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_invalid_status_errors() {
+        let text = "status: maybe\nsummary: something\nleft_off: something";
+        assert!(parse_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_whitespace_trimmed() {
+        let text = "  status:   in-progress  \n  summary:   spaced out   \n  left_off:   also spaced   ";
+        let (status, summary, left_off) = parse_response(text).unwrap();
+        assert_eq!(status, SessionStatus::InProgress);
+        assert_eq!(summary, "spaced out");
+        assert_eq!(left_off, "also spaced");
+    }
+
+    #[test]
+    fn parse_empty_string_errors() {
+        assert!(parse_response("").is_err());
+    }
 }

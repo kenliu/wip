@@ -7,6 +7,7 @@ mod install_mode;
 mod scan_mode;
 mod stats_mode;
 mod user_mode;
+mod util;
 
 #[derive(Parser)]
 #[command(name = "wip")]

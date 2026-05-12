@@ -6,7 +6,7 @@ pub mod jsonl_parser;
 pub mod lm_summarizer;
 
 use crate::config::{config_path, Config, ScanConfig, SummaryBackend};
-use crate::index::{acquire_lock, index_path, Index, SessionEntry};
+use crate::index::{acquire_lock, index_path, Index, SessionEntry, SessionStatus};
 use lm_summarizer::SummarizerConfig;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,23 +39,6 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-fn timestamp_str() -> String {
-    // Manual date formatting to avoid adding a chrono dependency just for logging.
-    // This is approximate (ignores leap years/days) but good enough for a log file.
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let s = now % 60;
-    let m = (now / 60) % 60;
-    let h = (now / 3600) % 24;
-    let days = now / 86400;
-    let year = 1970 + days / 365;
-    let day_of_year = days % 365;
-    let month = day_of_year / 30 + 1;
-    let day = day_of_year % 30 + 1;
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", year, month, day, h, m, s)
-}
 
 fn append_log(msg: &str) {
     let path = log_path();
@@ -194,14 +177,13 @@ pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Er
     });
     let pruned = before - index.sessions.len();
 
-    let in_progress = index.sessions.iter().filter(|s| s.status == "in-progress").count();
-    let done = index.sessions.iter().filter(|s| s.status == "done").count();
+    let in_progress = index.sessions.iter().filter(|s| s.status == SessionStatus::InProgress).count();
+    let done = index.sessions.iter().filter(|s| s.status == SessionStatus::Done).count();
 
     index.save(&index_path())?;
 
     let total_tokens = input_tokens_total + output_tokens_total;
     let log_entry = serde_json::json!({
-        "timestamp": timestamp_str(),
         "unix_ts": now,
         "summaries_run": summaries_run,
         "in_progress": in_progress,
@@ -310,12 +292,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<(), Box<dyn std::er
         }
     };
 
-    let config = Config {
-        scan,
-        providers: std::collections::HashMap::new(),
-        storage_dir: "~/.wip".to_string(),
-        index_refresh_threshold: 3600,
-    };
+    let config = Config { scan, resume_command: None };
     config.save(&config_path.to_path_buf())?;
 
     eprintln!("\nCreated {}.", config_path.display());

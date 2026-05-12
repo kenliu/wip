@@ -3,6 +3,22 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::PathBuf;
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStatus {
+    InProgress,
+    Done,
+}
+
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionStatus::InProgress => write!(f, "in-progress"),
+            SessionStatus::Done => write!(f, "done"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Index {
     pub sessions: Vec<SessionEntry>,
@@ -14,7 +30,7 @@ pub struct SessionEntry {
     // UUID filename stem, passed to `claude --resume` to resume the session
     pub session_id: String,
     pub provider: String,
-    pub status: String, // "in-progress" or "done"
+    pub status: SessionStatus,
     // Unix timestamps — i64 to match filesystem mtime values
     pub file_modified_at: i64,
     pub last_scanned_at: i64,
@@ -124,7 +140,7 @@ impl Index {
     pub fn in_progress_sessions(&self) -> Vec<&SessionEntry> {
         let mut sessions: Vec<&SessionEntry> = self.sessions
             .iter()
-            .filter(|s| s.status == "in-progress" && !s.manually_done)
+            .filter(|s| s.status == SessionStatus::InProgress && !s.manually_done)
             .collect();
         // Most recently modified first — these are the sessions the user is most
         // likely to want to return to
@@ -154,5 +170,252 @@ impl Index {
         } else {
             self.sessions.push(session);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session(id: &str, status: SessionStatus, mtime: i64) -> SessionEntry {
+        SessionEntry {
+            path: format!("/tmp/{}.jsonl", id),
+            session_id: id.to_string(),
+            provider: "claude-code".to_string(),
+            status,
+            file_modified_at: mtime,
+            last_scanned_at: mtime,
+            summary: "test summary".to_string(),
+            left_off: "test left off".to_string(),
+            cwd: Some("/home/user/project".to_string()),
+            continuation: false,
+            last_prompt: None,
+            manually_done: false,
+            flagged: false,
+            custom_title: None,
+            file_size_bytes: 1000,
+            turn_count: 5,
+            message_count: 10,
+            duration_secs: Some(300),
+        }
+    }
+
+    // ── SessionStatus serde ─────────────────────────────────────────────
+
+    #[test]
+    fn status_serializes_to_kebab_case() {
+        assert_eq!(serde_json::to_string(&SessionStatus::InProgress).unwrap(), "\"in-progress\"");
+        assert_eq!(serde_json::to_string(&SessionStatus::Done).unwrap(), "\"done\"");
+    }
+
+    #[test]
+    fn status_deserializes_from_kebab_case() {
+        let ip: SessionStatus = serde_json::from_str("\"in-progress\"").unwrap();
+        assert_eq!(ip, SessionStatus::InProgress);
+        let done: SessionStatus = serde_json::from_str("\"done\"").unwrap();
+        assert_eq!(done, SessionStatus::Done);
+    }
+
+    #[test]
+    fn status_display() {
+        assert_eq!(SessionStatus::InProgress.to_string(), "in-progress");
+        assert_eq!(SessionStatus::Done.to_string(), "done");
+    }
+
+    #[test]
+    fn status_invalid_deserialize_errors() {
+        let result = serde_json::from_str::<SessionStatus>("\"maybe\"");
+        assert!(result.is_err());
+    }
+
+    // ── Index save/load round-trip ──────────────────────────────────────
+
+    #[test]
+    fn save_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("def", SessionStatus::Done, 2000));
+        index.save(&path).unwrap();
+
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.sessions.len(), 2);
+        assert_eq!(loaded.sessions[0].session_id, "abc");
+        assert_eq!(loaded.sessions[0].status, SessionStatus::InProgress);
+        assert_eq!(loaded.sessions[1].session_id, "def");
+        assert_eq!(loaded.sessions[1].status, SessionStatus::Done);
+    }
+
+    #[test]
+    fn load_nonexistent_returns_empty() {
+        let path = PathBuf::from("/tmp/nonexistent_wip_test_index.json");
+        let index = Index::load(&path).unwrap();
+        assert!(index.sessions.is_empty());
+    }
+
+    // ── upsert ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_inserts_new() {
+        let mut index = Index::default();
+        index.upsert(make_session("abc", SessionStatus::InProgress, 1000));
+        assert_eq!(index.sessions.len(), 1);
+        assert_eq!(index.sessions[0].session_id, "abc");
+    }
+
+    #[test]
+    fn upsert_updates_existing_by_path() {
+        let mut index = Index::default();
+        index.upsert(make_session("abc", SessionStatus::InProgress, 1000));
+
+        let mut updated = make_session("abc", SessionStatus::Done, 2000);
+        updated.summary = "updated summary".to_string();
+        index.upsert(updated);
+
+        assert_eq!(index.sessions.len(), 1);
+        assert_eq!(index.sessions[0].status, SessionStatus::Done);
+        assert_eq!(index.sessions[0].summary, "updated summary");
+    }
+
+    #[test]
+    fn upsert_preserves_flagged_and_manually_done() {
+        let mut index = Index::default();
+        let mut s = make_session("abc", SessionStatus::InProgress, 1000);
+        s.flagged = true;
+        s.manually_done = true;
+        index.sessions.push(s);
+
+        let updated = make_session("abc", SessionStatus::InProgress, 2000);
+        index.upsert(updated);
+
+        assert!(index.sessions[0].flagged);
+        assert!(index.sessions[0].manually_done);
+    }
+
+    // ── mark_manually_done ──────────────────────────────────────────────
+
+    #[test]
+    fn mark_manually_done_sets_flag() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc", SessionStatus::InProgress, 1000));
+        index.mark_manually_done("abc");
+        assert!(index.sessions[0].manually_done);
+    }
+
+    #[test]
+    fn mark_manually_done_no_match_is_noop() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc", SessionStatus::InProgress, 1000));
+        index.mark_manually_done("xyz");
+        assert!(!index.sessions[0].manually_done);
+    }
+
+    // ── toggle_flagged ──────────────────────────────────────────────────
+
+    #[test]
+    fn toggle_flagged_on_off() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc", SessionStatus::InProgress, 1000));
+
+        index.toggle_flagged("abc");
+        assert!(index.sessions[0].flagged);
+
+        index.toggle_flagged("abc");
+        assert!(!index.sessions[0].flagged);
+    }
+
+    // ── all_sessions ────────────────────────────────────────────────────
+
+    #[test]
+    fn all_sessions_sorted_by_recency() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("old", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("new", SessionStatus::InProgress, 3000));
+        index.sessions.push(make_session("mid", SessionStatus::InProgress, 2000));
+
+        let all = index.all_sessions();
+        assert_eq!(all[0].session_id, "new");
+        assert_eq!(all[1].session_id, "mid");
+        assert_eq!(all[2].session_id, "old");
+    }
+
+    #[test]
+    fn all_sessions_includes_done() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("ip", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("done", SessionStatus::Done, 2000));
+
+        let all = index.all_sessions();
+        assert_eq!(all.len(), 2);
+    }
+
+    // ── in_progress_sessions ────────────────────────────────────────────
+
+    #[test]
+    fn in_progress_filters_done() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("ip", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("done", SessionStatus::Done, 2000));
+
+        let result = index.in_progress_sessions();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].session_id, "ip");
+    }
+
+    #[test]
+    fn in_progress_filters_manually_done() {
+        let mut index = Index::default();
+        let mut s = make_session("ip", SessionStatus::InProgress, 1000);
+        s.manually_done = true;
+        index.sessions.push(s);
+
+        let result = index.in_progress_sessions();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn in_progress_sorted_by_recency() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("old", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("new", SessionStatus::InProgress, 3000));
+
+        let result = index.in_progress_sessions();
+        assert_eq!(result[0].session_id, "new");
+        assert_eq!(result[1].session_id, "old");
+    }
+
+    #[test]
+    fn in_progress_deduplicates_continuations_by_cwd() {
+        let mut index = Index::default();
+
+        let mut newer = make_session("newer", SessionStatus::InProgress, 2000);
+        newer.continuation = true;
+        newer.cwd = Some("/project".to_string());
+        index.sessions.push(newer);
+
+        let mut older = make_session("older", SessionStatus::InProgress, 1000);
+        older.continuation = true;
+        older.cwd = Some("/project".to_string());
+        index.sessions.push(older);
+
+        let result = index.in_progress_sessions();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].session_id, "newer");
+    }
+
+    #[test]
+    fn in_progress_non_continuations_always_shown() {
+        let mut index = Index::default();
+
+        let s1 = make_session("s1", SessionStatus::InProgress, 2000);
+        index.sessions.push(s1);
+
+        let s2 = make_session("s2", SessionStatus::InProgress, 1000);
+        index.sessions.push(s2);
+
+        let result = index.in_progress_sessions();
+        assert_eq!(result.len(), 2);
     }
 }

@@ -1,25 +1,11 @@
 // Fast mode: fzf-powered session picker for keyboard-optimized selection.
 // Requires fzf to be installed (`brew install fzf`).
 
+use crate::config::Config;
 use crate::index::{index_path, Index};
+use crate::util::{format_age, project_name};
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-fn format_age(file_modified_at: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let secs = (now - file_modified_at).max(0);
-    if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
-}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -28,13 +14,6 @@ fn truncate(s: &str, max: usize) -> String {
         // Count by chars not bytes to avoid splitting multi-byte UTF-8 characters
         s.chars().take(max.saturating_sub(3)).collect::<String>() + "..."
     }
-}
-
-fn project_name(cwd: &str) -> String {
-    std::path::Path::new(cwd)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,16 +89,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     print!("\x1B[2J\x1B[1;1H");
     std::io::stdout().flush()?;
 
-    // exec() replaces this process with claude entirely — no wip process remains.
-    // current_dir() sets the working directory for claude, not the parent shell
+    let config = Config::load().unwrap_or(Config { scan: Default::default(), resume_command: None });
+    // exec() replaces this process entirely — no wip process remains.
+    // current_dir() sets the working directory, not the parent shell
     // (see GitHub issue #2 for shell integration to solve the cwd-after-exit problem)
     use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new("claude");
-    cmd.arg("--resume").arg(&session_id);
+    let mut cmd = config.resume_cmd(&session_id);
     if !cwd.is_empty() {
         cmd.current_dir(&cwd);
     }
     let err = cmd.exec();
 
-    Err(format!("Failed to launch claude: {}", err).into())
+    Err(format!("Failed to launch: {}", err).into())
 }

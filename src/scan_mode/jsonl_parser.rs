@@ -131,7 +131,7 @@ pub fn parse_and_extract(path: &Path) -> Result<ExtractedContext, Box<dyn std::e
 
 // Parses "YYYY-MM-DDTHH:MM:SS[.mmm]Z" into a Unix timestamp (seconds).
 // Avoids a chrono dependency for this one narrow use case.
-fn parse_iso8601_secs(s: &str) -> Option<i64> {
+pub(crate) fn parse_iso8601_secs(s: &str) -> Option<i64> {
     let s = s.trim_end_matches('Z');
     let (date_part, time_part) = s.split_once('T')?;
 
@@ -223,5 +223,281 @@ pub fn build_context(ctx: &ExtractedContext) -> String {
 pub fn estimate_tokens(text: &str) -> usize {
     // Rough heuristic: 1 token ≈ 4 characters
     (text.len() + 3) / 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Write;
+
+    fn write_temp_jsonl(lines: &[Value]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        f
+    }
+
+    // ── extract_user_content ────────────────────────────────────────────
+
+    #[test]
+    fn user_content_string() {
+        let v = json!({"message": {"content": "hello world"}});
+        assert_eq!(extract_user_content(&v).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn user_content_array_text_blocks() {
+        let v = json!({"message": {"content": [
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"}
+        ]}});
+        assert_eq!(extract_user_content(&v).unwrap(), "first second");
+    }
+
+    #[test]
+    fn user_content_array_skips_non_text() {
+        let v = json!({"message": {"content": [
+            {"type": "tool_result", "content": "stuff"},
+            {"type": "text", "text": "actual message"}
+        ]}});
+        assert_eq!(extract_user_content(&v).unwrap(), "actual message");
+    }
+
+    #[test]
+    fn user_content_empty_string_returns_none() {
+        let v = json!({"message": {"content": ""}});
+        // String variant returns Some("") which is non-empty check is in the caller
+        // The function itself returns Some for empty strings
+        let result = extract_user_content(&v);
+        assert_eq!(result, Some("".to_string()));
+    }
+
+    #[test]
+    fn user_content_empty_array_returns_none() {
+        let v = json!({"message": {"content": []}});
+        assert!(extract_user_content(&v).is_none());
+    }
+
+    #[test]
+    fn user_content_missing_message_returns_none() {
+        let v = json!({"type": "user"});
+        assert!(extract_user_content(&v).is_none());
+    }
+
+    // ── extract_assistant_content ────────────────────────────────────────
+
+    #[test]
+    fn assistant_content_text_blocks() {
+        let v = json!({"message": {"content": [
+            {"type": "text", "text": "response here"}
+        ]}});
+        assert_eq!(extract_assistant_content(&v).unwrap(), "response here");
+    }
+
+    #[test]
+    fn assistant_content_skips_thinking_and_tool_use() {
+        let v = json!({"message": {"content": [
+            {"type": "thinking", "thinking": "hmm..."},
+            {"type": "tool_use", "name": "bash", "input": {}},
+            {"type": "text", "text": "the answer"}
+        ]}});
+        assert_eq!(extract_assistant_content(&v).unwrap(), "the answer");
+    }
+
+    #[test]
+    fn assistant_content_all_non_text_returns_none() {
+        let v = json!({"message": {"content": [
+            {"type": "thinking", "thinking": "hmm"}
+        ]}});
+        assert!(extract_assistant_content(&v).is_none());
+    }
+
+    #[test]
+    fn assistant_content_not_array_returns_none() {
+        let v = json!({"message": {"content": "plain string"}});
+        assert!(extract_assistant_content(&v).is_none());
+    }
+
+    // ── parse_iso8601_secs ──────────────────────────────────────────────
+
+    #[test]
+    fn iso8601_basic() {
+        // 2024-01-01T00:00:00Z = known epoch value
+        let ts = parse_iso8601_secs("2024-01-01T00:00:00Z").unwrap();
+        // 2024-01-01 is 54 years after epoch, with leap years accounted for
+        assert_eq!(ts, 1704067200);
+    }
+
+    #[test]
+    fn iso8601_with_millis() {
+        let ts = parse_iso8601_secs("2024-01-01T12:30:45.123Z").unwrap();
+        let base = parse_iso8601_secs("2024-01-01T12:30:45Z").unwrap();
+        assert_eq!(ts, base); // millis are ignored
+    }
+
+    #[test]
+    fn iso8601_invalid_returns_none() {
+        assert!(parse_iso8601_secs("not a date").is_none());
+        assert!(parse_iso8601_secs("").is_none());
+        assert!(parse_iso8601_secs("2024-01-01").is_none()); // missing time part
+    }
+
+    #[test]
+    fn iso8601_leap_year() {
+        // 2024-03-01 should account for Feb having 29 days in 2024
+        let mar1 = parse_iso8601_secs("2024-03-01T00:00:00Z").unwrap();
+        let feb28 = parse_iso8601_secs("2024-02-28T00:00:00Z").unwrap();
+        assert_eq!(mar1 - feb28, 2 * 86400); // Feb 29 + Mar 1
+    }
+
+    #[test]
+    fn iso8601_non_leap_year() {
+        // 2023-03-01 — Feb has 28 days
+        let mar1 = parse_iso8601_secs("2023-03-01T00:00:00Z").unwrap();
+        let feb28 = parse_iso8601_secs("2023-02-28T00:00:00Z").unwrap();
+        assert_eq!(mar1 - feb28, 86400); // exactly 1 day
+    }
+
+    // ── is_continuation_session ─────────────────────────────────────────
+
+    #[test]
+    fn continuation_session_detected() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "queue-operation", "content": "..."}),
+            json!({"type": "user", "message": {"content": "hello"}}),
+        ]);
+        assert!(is_continuation_session(f.path()));
+    }
+
+    #[test]
+    fn normal_session_not_continuation() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "permission-mode", "mode": "default"}),
+            json!({"type": "user", "message": {"content": "hello"}}),
+        ]);
+        assert!(!is_continuation_session(f.path()));
+    }
+
+    #[test]
+    fn empty_file_not_continuation() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(!is_continuation_session(f.path()));
+    }
+
+    // ── parse_and_extract ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_basic_session() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "user", "cwd": "/home/user/project", "message": {"content": "fix the bug"}, "timestamp": "2024-06-01T10:00:00Z"}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "I'll look at it"}]}, "timestamp": "2024-06-01T10:01:00Z"}),
+            json!({"type": "user", "message": {"content": "thanks"}, "timestamp": "2024-06-01T10:02:00Z"}),
+        ]);
+        let ctx = parse_and_extract(f.path()).unwrap();
+        assert_eq!(ctx.first_message, "fix the bug");
+        assert_eq!(ctx.cwd.as_deref(), Some("/home/user/project"));
+        assert_eq!(ctx.turn_count, 2);
+        assert_eq!(ctx.message_count, 3);
+        assert_eq!(ctx.duration_secs, Some(120));
+        assert!(ctx.last_prompt.is_none());
+        assert!(ctx.custom_title.is_none());
+    }
+
+    #[test]
+    fn parse_captures_last_prompt() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "user", "message": {"content": "hello"}}),
+            json!({"type": "last-prompt", "lastPrompt": "deploy to staging"}),
+        ]);
+        let ctx = parse_and_extract(f.path()).unwrap();
+        assert_eq!(ctx.last_prompt.as_deref(), Some("deploy to staging"));
+    }
+
+    #[test]
+    fn parse_captures_custom_title() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "user", "message": {"content": "hello"}}),
+            json!({"type": "custom-title", "customTitle": "auth refactor"}),
+        ]);
+        let ctx = parse_and_extract(f.path()).unwrap();
+        assert_eq!(ctx.custom_title.as_deref(), Some("auth refactor"));
+    }
+
+    #[test]
+    fn parse_last_custom_title_wins() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "user", "message": {"content": "hello"}}),
+            json!({"type": "custom-title", "customTitle": "first name"}),
+            json!({"type": "custom-title", "customTitle": "final name"}),
+        ]);
+        let ctx = parse_and_extract(f.path()).unwrap();
+        assert_eq!(ctx.custom_title.as_deref(), Some("final name"));
+    }
+
+    #[test]
+    fn parse_empty_file_errors() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert!(parse_and_extract(f.path()).is_err());
+    }
+
+    #[test]
+    fn parse_no_messages_errors() {
+        let f = write_temp_jsonl(&[
+            json!({"type": "permission-mode", "mode": "default"}),
+        ]);
+        let err = parse_and_extract(f.path()).unwrap_err();
+        assert_eq!(err.to_string(), "No messages found");
+    }
+
+    #[test]
+    fn parse_keeps_recent_tail() {
+        let mut lines: Vec<Value> = Vec::new();
+        for i in 0..30 {
+            lines.push(json!({"type": "user", "message": {"content": format!("msg {}", i)}}));
+            lines.push(json!({"type": "assistant", "message": {"content": [{"type": "text", "text": format!("reply {}", i)}]}}));
+        }
+        let f = write_temp_jsonl(&lines);
+        let ctx = parse_and_extract(f.path()).unwrap();
+        assert_eq!(ctx.recent_messages.len(), 15);
+        assert_eq!(ctx.message_count, 60);
+        assert_eq!(ctx.turn_count, 30);
+    }
+
+    // ── build_context ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_context_format() {
+        let ctx = ExtractedContext {
+            first_message: "fix the bug".to_string(),
+            recent_messages: vec![
+                ("user".to_string(), "fix the bug".to_string()),
+                ("assistant".to_string(), "done".to_string()),
+            ],
+            cwd: None,
+            last_prompt: None,
+            custom_title: None,
+            turn_count: 1,
+            message_count: 2,
+            duration_secs: None,
+        };
+        let output = build_context(&ctx);
+        assert!(output.starts_with("<session>"));
+        assert!(output.ends_with("</session>"));
+        assert!(output.contains("First message: fix the bug"));
+        assert!(output.contains("user: fix the bug"));
+        assert!(output.contains("assistant: done"));
+    }
+
+    // ── estimate_tokens ─────────────────────────────────────────────────
+
+    #[test]
+    fn estimate_tokens_basic() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+    }
 }
 

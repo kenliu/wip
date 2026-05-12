@@ -1,7 +1,7 @@
 use crate::config::Config;
-use crate::index::{index_path, Index};
+use crate::index::{index_path, Index, SessionStatus};
+use crate::util::format_age_long;
 use serde::Deserialize;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn scan_log_path() -> std::path::PathBuf {
     dirs::home_dir()
@@ -12,7 +12,6 @@ fn scan_log_path() -> std::path::PathBuf {
 
 #[derive(Deserialize)]
 struct ScanLogEntry {
-    timestamp: String,
     #[serde(default)]
     unix_ts: i64,
     summaries_run: u32,
@@ -24,23 +23,6 @@ struct ScanLogEntry {
 struct TokenCounts {
     input: u64,
     output: u64,
-}
-
-fn format_age(unix_ts: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let secs = (now - unix_ts).max(0);
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{} min ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{} hours ago", secs / 3600)
-    } else {
-        format!("{} days ago", secs / 86400)
-    }
 }
 
 fn format_number(n: u64) -> String {
@@ -60,7 +42,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_output: u64 = 0;
     let mut total_summaries: u32 = 0;
     let mut last_unix_ts: i64 = 0;
-    let mut last_timestamp_str: Option<String> = None;
     let mut scan_count: u32 = 0;
 
     let log_path = scan_log_path();
@@ -80,7 +61,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if entry.unix_ts > last_unix_ts {
                 last_unix_ts = entry.unix_ts;
             }
-            last_timestamp_str = Some(entry.timestamp);
             scan_count += 1;
         }
     }
@@ -103,10 +83,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Summaries run: {}", total_summaries);
     println!("  Scans logged:  {}", scan_count);
 
-    match (last_unix_ts > 0, last_timestamp_str.as_deref()) {
-        (true, _) => println!("  Last scan:     {}", format_age(last_unix_ts)),
-        (false, Some(ts)) => println!("  Last scan:     {}", ts),
-        (false, None) => println!("  Last scan:     never"),
+    if last_unix_ts > 0 {
+        println!("  Last scan:     {}", format_age_long(last_unix_ts));
+    } else {
+        println!("  Last scan:     never");
     }
 
     if let Some(p) = pricing {
@@ -120,9 +100,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let in_progress = index
         .sessions
         .iter()
-        .filter(|s| s.status == "in-progress")
+        .filter(|s| s.status == SessionStatus::InProgress)
         .count();
-    let done = index.sessions.iter().filter(|s| s.status == "done").count();
+    let done = index.sessions.iter().filter(|s| s.status == SessionStatus::Done).count();
 
     println!();
     println!("Session Index");
@@ -134,7 +114,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::collections::BTreeMap::new();
     for s in &index.sessions {
         let entry = by_provider.entry(s.provider.as_str()).or_default();
-        if s.status == "in-progress" {
+        if s.status == SessionStatus::InProgress {
             entry.0 += 1;
         } else {
             entry.1 += 1;

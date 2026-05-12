@@ -4,6 +4,7 @@
 
 mod tui;
 
+use crate::config::Config;
 use crate::index::{index_path, Index};
 use crate::scan_mode;
 use std::io::Write;
@@ -65,16 +66,16 @@ pub async fn run(background_scan: bool) -> Result<(), Box<dyn std::error::Error>
             print!("\x1B[2J\x1B[1;1H");
             std::io::stdout().flush()?;
 
+            let config = Config::load().unwrap_or(Config { scan: Default::default(), resume_command: None });
             // exec() replaces this process entirely — no wip process remains in the process table
             use std::os::unix::process::CommandExt;
-            let mut cmd = std::process::Command::new("claude");
-            cmd.arg("--resume").arg(&session_id);
+            let mut cmd = config.resume_cmd(&session_id);
             if let Some(ref cwd) = cwd {
                 if !cwd.is_empty() {
                     cmd.current_dir(cwd);
                 }
             }
-            Err(format!("Failed to launch claude: {}", cmd.exec()).into())
+            Err(format!("Failed to launch: {}", cmd.exec()).into())
         }
     }
 }

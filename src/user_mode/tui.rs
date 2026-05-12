@@ -1,4 +1,6 @@
-use crate::index::{acquire_lock, Index, SessionEntry};
+use crate::config::Config;
+use crate::index::{acquire_lock, Index, SessionEntry, SessionStatus};
+use crate::util::{format_age, project_name};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -65,21 +67,6 @@ fn record_false_positive(session: &SessionEntry) {
     }
 }
 
-fn format_age(ts: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let secs = (now - ts).max(0);
-    if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
-}
-
 fn format_size(bytes: u64) -> String {
     if bytes >= 1_048_576 {
         format!("{:.1}M", bytes as f64 / 1_048_576.0)
@@ -88,13 +75,6 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{}B", bytes)
     }
-}
-
-fn project_name(cwd: &str) -> String {
-    std::path::Path::new(cwd)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 // ── Chat preview helpers ──────────────────────────────────────────────────────
@@ -233,6 +213,8 @@ struct App {
     show_preview: bool,
     // Keyed by session_id; populated lazily on first render of each session
     preview_cache: HashMap<String, Vec<(String, String)>>,
+    // Transient error message shown in the footer, cleared on next keypress
+    error_message: Option<String>,
 }
 
 impl App {
@@ -248,11 +230,12 @@ impl App {
             show_all: ui_state.show_all,
             show_preview: ui_state.show_preview,
             preview_cache: HashMap::new(),
+            error_message: None,
         }
     }
 
     fn is_done(s: &SessionEntry) -> bool {
-        s.status == "done" || s.manually_done
+        s.status == SessionStatus::Done || s.manually_done
     }
 
     // Returns sessions matching the current filter and flagged_only/show_all modes.
@@ -392,12 +375,11 @@ impl App {
 
     fn render_session_list(&self, frame: &mut ratatui::Frame, area: Rect) {
         let filtered = self.filtered();
-        let list_area = area;
 
         // ── Session list ─────────────────────────────────────────────────────
-        let list_height = list_area.height;
+        let list_height = area.height;
         let offset = self.scroll_offset(list_height);
-        let max_width = list_area.width as usize;
+        let max_width = area.width as usize;
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -505,7 +487,7 @@ impl App {
             }
         }
 
-        frame.render_widget(Paragraph::new(lines), list_area);
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -514,6 +496,18 @@ impl App {
         let footer_base = Style::default().fg(Color::Gray).bg(bg);
         let key_style = Style::default().fg(Color::Cyan).bg(bg).add_modifier(Modifier::BOLD);
         let label_style = Style::default().fg(Color::Rgb(100, 110, 120)).bg(bg);
+
+        if let Some(ref msg) = self.error_message {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("  {}", msg),
+                    Style::default().fg(Color::Red).bg(bg),
+                )))
+                .style(Style::default().bg(bg)),
+                area,
+            );
+            return;
+        }
 
         if self.filter_mode {
             frame.render_widget(
@@ -642,6 +636,7 @@ pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &st
         terminal.draw(|f| app.render(f))?;
 
         if let Event::Key(key) = event::read()? {
+            app.error_message = None;
             if app.filter_mode {
                 match key.code {
                     // Esc cancels the filter entirely and returns to normal mode
@@ -710,9 +705,18 @@ pub fn run(sessions: Vec<SessionEntry>, initial_selected: usize, index_path: &st
                                     cmd.args(["--cwd", dir]);
                                 }
                             }
-                            cmd.args(["--", "claude", "--resume", &s.session_id]);
+                            let config = Config::load().unwrap_or(Config { scan: Default::default(), resume_command: None });
+                            cmd.arg("--").args(config.resume_argv(&s.session_id));
                             cmd.stdout(std::process::Stdio::null());
-                            let _ = cmd.spawn();
+                            match cmd.spawn() {
+                                Ok(_) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    app.error_message = Some("wezterm not found — 'open in tab' requires WezTerm".to_string());
+                                }
+                                Err(e) => {
+                                    app.error_message = Some(format!("open in tab failed: {}", e));
+                                }
+                            }
                         }
                     }
                     KeyCode::Right => app.show_preview = true,
