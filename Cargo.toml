@@ -19,6 +19,7 @@ fd-lock = "4"
 dotenvy = "0.15"
 ratatui = "0.30"
 crossterm = "0.29"
+secret-service = { version = "5.1.0", default-features = false, features = ["rt-tokio-crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
