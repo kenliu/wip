@@ -58,6 +58,14 @@ const MIN_AGE_SECS: i64 = 30;
 pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Error>> {
     let summarizer_config = build_summarizer_config()?;
 
+    let host = api_host(&summarizer_config);
+    if !is_network_reachable(&host).await {
+        if !silent {
+            eprintln!("wip: network unreachable ({}), skipping scan.", host);
+        }
+        return Ok(());
+    }
+
     let _lock = acquire_lock()?;
     let path = index_path();
     let mut index = Index::load(&path)?;
@@ -199,6 +207,28 @@ pub async fn run(force: bool, silent: bool) -> Result<(), Box<dyn std::error::Er
     if !silent { eprintln!("{}", log_entry); }
 
     Ok(())
+}
+
+fn api_host(config: &lm_summarizer::SummarizerConfig) -> String {
+    match config {
+        lm_summarizer::SummarizerConfig::Anthropic { .. } => "api.anthropic.com:443".to_string(),
+        lm_summarizer::SummarizerConfig::Vertex { region, .. } => {
+            if region == "global" {
+                "aiplatform.googleapis.com:443".to_string()
+            } else {
+                format!("{region}-aiplatform.googleapis.com:443")
+            }
+        }
+    }
+}
+
+async fn is_network_reachable(host: &str) -> bool {
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+    timeout(Duration::from_secs(3), TcpStream::connect(host))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
 }
 
 /// Builds the summarizer config, running an interactive setup wizard to create
