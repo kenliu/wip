@@ -131,6 +131,34 @@ impl Index {
         }
     }
 
+    pub fn set_flagged(&mut self, session_id: &str, flagged: bool) {
+        if let Some(entry) = self.sessions.iter_mut().find(|s| s.session_id == session_id) {
+            entry.flagged = flagged;
+        }
+    }
+
+    /// Find a session by exact ID or unique prefix. Returns an error message if
+    /// no match is found or the prefix is ambiguous.
+    pub fn find_by_prefix(&self, prefix: &str) -> Result<&SessionEntry, String> {
+        if let Some(entry) = self.sessions.iter().find(|s| s.session_id == prefix) {
+            return Ok(entry);
+        }
+        let matches: Vec<&SessionEntry> = self.sessions.iter()
+            .filter(|s| s.session_id.starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => Err(format!("No session found matching '{}'", prefix)),
+            1 => Ok(matches[0]),
+            n => {
+                let ids: Vec<&str> = matches.iter().map(|s| s.session_id.as_str()).collect();
+                Err(format!(
+                    "Ambiguous prefix '{}' matches {} sessions: {}",
+                    prefix, n, ids.join(", ")
+                ))
+            }
+        }
+    }
+
     pub fn all_sessions(&self) -> Vec<&SessionEntry> {
         let mut sessions: Vec<&SessionEntry> = self.sessions.iter().collect();
         sessions.sort_by(|a, b| b.file_modified_at.cmp(&a.file_modified_at));
@@ -324,6 +352,73 @@ mod tests {
 
         index.toggle_flagged("abc");
         assert!(!index.sessions[0].flagged);
+    }
+
+    // ── set_flagged ─────────────────────────────────────────────────────
+
+    #[test]
+    fn set_flagged_true() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc", SessionStatus::InProgress, 1000));
+        index.set_flagged("abc", true);
+        assert!(index.sessions[0].flagged);
+    }
+
+    #[test]
+    fn set_flagged_idempotent() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc", SessionStatus::InProgress, 1000));
+        index.set_flagged("abc", true);
+        index.set_flagged("abc", true);
+        assert!(index.sessions[0].flagged);
+    }
+
+    #[test]
+    fn set_flagged_false() {
+        let mut index = Index::default();
+        let mut s = make_session("abc", SessionStatus::InProgress, 1000);
+        s.flagged = true;
+        index.sessions.push(s);
+        index.set_flagged("abc", false);
+        assert!(!index.sessions[0].flagged);
+    }
+
+    // ── find_by_prefix ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_by_prefix_exact_match() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc-123", SessionStatus::InProgress, 1000));
+        let result = index.find_by_prefix("abc-123");
+        assert_eq!(result.unwrap().session_id, "abc-123");
+    }
+
+    #[test]
+    fn find_by_prefix_unique_prefix() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc-123", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("def-456", SessionStatus::InProgress, 2000));
+        let result = index.find_by_prefix("abc");
+        assert_eq!(result.unwrap().session_id, "abc-123");
+    }
+
+    #[test]
+    fn find_by_prefix_no_match() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc-123", SessionStatus::InProgress, 1000));
+        let result = index.find_by_prefix("xyz");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No session found"));
+    }
+
+    #[test]
+    fn find_by_prefix_ambiguous() {
+        let mut index = Index::default();
+        index.sessions.push(make_session("abc-123", SessionStatus::InProgress, 1000));
+        index.sessions.push(make_session("abc-456", SessionStatus::InProgress, 2000));
+        let result = index.find_by_prefix("abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Ambiguous"));
     }
 
     // ── all_sessions ────────────────────────────────────────────────────

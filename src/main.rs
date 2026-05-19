@@ -42,6 +42,16 @@ enum Command {
     },
     /// Show token usage and scan statistics
     Stats,
+    /// Flag a session by ID (supports unique prefix matching)
+    Flag {
+        /// Full or partial session ID
+        session_id: String,
+    },
+    /// Remove the flag from a session by ID (supports unique prefix matching)
+    Unflag {
+        /// Full or partial session ID
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -65,6 +75,8 @@ async fn main() {
             action: IndexAction::Clear,
         }) => index_clear(),
         Some(Command::Stats) => stats_mode::run(),
+        Some(Command::Flag { session_id }) => flag_session(&session_id, true),
+        Some(Command::Unflag { session_id }) => flag_session(&session_id, false),
     };
 
     if let Err(e) = result {
@@ -77,6 +89,26 @@ async fn main() {
         }
         std::process::exit(1);
     }
+}
+
+fn flag_session(prefix: &str, flagged: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let path = index::index_path();
+    let _lock = index::acquire_lock()?;
+    let mut idx = index::Index::load(&path)?;
+
+    let session = idx.find_by_prefix(prefix)?;
+    let session_id = session.session_id.clone();
+    let summary = session.summary.clone();
+
+    idx.set_flagged(&session_id, flagged);
+    idx.save(&path)?;
+
+    if flagged {
+        println!("Flagged session {} ({})", session_id, summary);
+    } else {
+        println!("Unflagged session {} ({})", session_id, summary);
+    }
+    Ok(())
 }
 
 fn index_clear() -> Result<(), Box<dyn std::error::Error>> {
