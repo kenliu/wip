@@ -20,6 +20,9 @@ struct Cli {
     /// Run a scan in the background while the TUI is open
     #[arg(long)]
     background_scan: bool,
+    /// Filter sessions to a project directory [default: current directory]
+    #[arg(short, long, default_value = ".", hide_default_value = true)]
+    project: String,
 }
 
 #[derive(Subcommand)]
@@ -60,14 +63,26 @@ enum IndexAction {
     Clear,
 }
 
+pub fn matches_project(session_cwd: Option<&str>, project_dir: &str) -> bool {
+    match session_cwd {
+        Some(cwd) => cwd.starts_with(project_dir),
+        None => false,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
+    let project_dir = std::fs::canonicalize(&cli.project)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&cli.project))
+        .to_string_lossy()
+        .to_string();
+
     let result = match cli.command {
-        None => user_mode::run(cli.background_scan).await,
-        Some(Command::Fast) => fast_mode::run().await,
+        None => user_mode::run(cli.background_scan, &project_dir).await,
+        Some(Command::Fast) => fast_mode::run(&project_dir).await,
         Some(Command::Scan { force }) => scan_mode::run(force, false).await,
         Some(Command::Install) => install_mode::install(),
         Some(Command::Uninstall) => install_mode::uninstall(),

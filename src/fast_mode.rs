@@ -16,7 +16,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(project_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     if Command::new("fzf").arg("--version").output().is_err() {
         return Err("fzf is not installed. Install it with: brew install fzf".into());
     }
@@ -26,6 +26,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .in_progress_sessions()
         .into_iter()
         .filter(|s| !s.session_id.starts_with("agent-"))
+        .filter(|s| crate::matches_project(s.cwd.as_deref(), project_dir))
         .collect();
 
     if sessions.is_empty() {

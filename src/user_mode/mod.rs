@@ -32,7 +32,7 @@ fn save_ui_state(state: &UiState) {
     }
 }
 
-pub async fn run(background_scan: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(background_scan: bool, project_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     if background_scan {
         tokio::spawn(async {
             // Errors are silently dropped — stderr would corrupt the TUI display,
@@ -48,6 +48,7 @@ pub async fn run(background_scan: bool) -> Result<(), Box<dyn std::error::Error>
         .all_sessions()
         .into_iter()
         .filter(|s| !s.session_id.starts_with("agent-"))
+        .filter(|s| crate::matches_project(s.cwd.as_deref(), project_dir))
         .cloned()
         .collect();
 
